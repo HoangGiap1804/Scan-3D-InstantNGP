@@ -1,0 +1,16 @@
+trimesh
+opencv-python
+tensorboardX
+numpy
+pandas
+tqdm
+matplotlib
+rich
+packaging
+scipy
+imageio
+lpips
+torch-ema
+PyMCubes
+pysdf
+dearpygui
