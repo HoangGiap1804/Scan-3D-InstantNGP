@@ -188,9 +188,11 @@ class _march_rays_train(Function):
         if not rays_d.is_cuda: rays_d = rays_d.cuda()
         if not density_bitfield.is_cuda: density_bitfield = density_bitfield.cuda()
         
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
+        rays_o = rays_o.float().contiguous().view(-1, 3)
+        rays_d = rays_d.float().contiguous().view(-1, 3)
         density_bitfield = density_bitfield.contiguous()
+        nears = nears.float().contiguous()
+        fars = fars.float().contiguous()
 
         N = rays_o.shape[0] # num rays
         M = N * max_steps # init max points number in total
@@ -251,8 +253,9 @@ class _composite_rays_train(Function):
             image: float, [N, 3], the RGB channel (after multiplying alpha!)
         '''
         
-        sigmas = sigmas.contiguous()
-        rgbs = rgbs.contiguous()
+        sigmas = sigmas.float().contiguous()
+        rgbs = rgbs.float().contiguous()
+        deltas = deltas.float().contiguous()
 
         M = sigmas.shape[0]
         N = rays.shape[0]
@@ -323,8 +326,11 @@ class _march_rays(Function):
         if not rays_o.is_cuda: rays_o = rays_o.cuda()
         if not rays_d.is_cuda: rays_d = rays_d.cuda()
         
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
+        rays_o = rays_o.float().contiguous().view(-1, 3)
+        rays_d = rays_d.float().contiguous().view(-1, 3)
+        rays_t = rays_t.float().contiguous()
+        nears = near.float().contiguous()
+        fars = far.float().contiguous()
 
         M = n_alive * n_step
 
@@ -341,7 +347,7 @@ class _march_rays(Function):
         else:
             noises = torch.zeros(n_alive, dtype=rays_o.dtype, device=rays_o.device)
 
-        _backend.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, dt_gamma, max_steps, C, H, density_bitfield, near, far, xyzs, dirs, deltas, noises)
+        _backend.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, dt_gamma, max_steps, C, H, density_bitfield, nears, fars, xyzs, dirs, deltas, noises)
 
         return xyzs, dirs, deltas
 
@@ -362,10 +368,14 @@ class _composite_rays(Function):
             rgbs: float, [n_alive * n_step, 3]
             deltas: float, [n_alive * n_step, 2], all generated points' deltas (here we record two deltas, the first is for RGB, the second for depth).
         In-place Outputs:
-            weights_sum: float, [N,], the alpha channel
             depth: float, [N,], the depth value
             image: float, [N, 3], the RGB channel (after multiplying alpha!)
         '''
+        sigmas = sigmas.float().contiguous()
+        rgbs = rgbs.float().contiguous()
+        deltas = deltas.float().contiguous()
+        rays_t = rays_t.float().contiguous()
+
         _backend.composite_rays(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image)
         return tuple()
 

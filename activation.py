@@ -7,12 +7,12 @@ class _trunc_exp(Function):
     @custom_fwd(cast_inputs=torch.float32) # cast to float32
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return torch.exp(x)
+        return torch.exp(x.clamp(-10, 10))
 
     @staticmethod
     @custom_bwd
     def backward(ctx, g):
         x = ctx.saved_tensors[0]
-        return g * torch.exp(x.clamp(-15, 15))
+        return g * torch.exp(x.clamp(-10, 10))
 
 trunc_exp = _trunc_exp.apply

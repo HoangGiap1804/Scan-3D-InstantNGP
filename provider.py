@@ -19,7 +19,7 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     return new_pose
 
 class NeRFDataset:
-    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10):
+    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10, num_rays=4096):
         super().__init__()
         
         self.root_path = path
@@ -34,7 +34,7 @@ class NeRFDataset:
         self.bound = 2
         self.fp16 = True
         self.color_space = 'srgb'
-        self.num_rays = 4096 if self.training else -1
+        self.num_rays = num_rays if self.training else -1
 
         # Load transforms.json
         json_path = os.path.join(self.root_path, f'transforms_{type}.json')

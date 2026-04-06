@@ -1,4 +1,6 @@
 import torch
+import cv2
+import numpy as np
 from packaging import version as pver
 
 def custom_meshgrid(*args):
@@ -110,3 +112,98 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+
+@torch.no_grad()
+def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, **kwargs):
+    ''' render a full image from a pose
+    Args:
+        model: NeRFRenderer
+        pose: [1, 4, 4]
+        intrinsics: [fl_x, fl_y, cx, cy]
+        H, W: int
+        bg_color: float, list of 3 floats, or torch.Tensor
+        **kwargs: additional arguments for model.render
+    Returns:
+        image: [H, W, 3], uint8
+    '''
+    device = pose.device
+    rays = get_rays(pose, intrinsics, H, W)
+    rays_o = rays['rays_o']
+    rays_d = rays['rays_d']
+    
+    # staged rendering for full image to avoid OOM
+    outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
+    image = outputs['image'].reshape(H, W, 3)
+    
+    # convert linear to srgb
+    image = linear_to_srgb(image)
+    image = (image.cpu().numpy() * 255).astype(np.uint8)
+    
+    return image
+
+
+def save_video(images, path, fps=10):
+    ''' save a list of images to a video using OpenCV
+    Args:
+        images: list of [H, W, 3] uint8
+        path: str
+        fps: int
+    '''
+    if len(images) == 0:
+        return
+    
+    # Force .avi extension for better compatibility with XVID
+    if not path.endswith('.avi'):
+        path = os.path.splitext(path)[0] + '.avi'
+    
+    H, W, _ = images[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(path, fourcc, fps, (W, H))
+    
+    for img in images:
+        # OpenCV uses BGR, so we need to convert from RGB
+        out.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        
+    out.release()
+    print(f"Video saved to {path}")
+def get_orbit_pose(azimuth, elevation, radius, center=np.array([0, 0, 0], dtype=np.float32)):
+    ''' get a camera pose for orbit viewing
+    Args:
+        azimuth, elevation: float (degrees)
+        radius: float
+        center: [3]
+    Returns:
+        pose: [4, 4]
+    '''
+    azimuth = np.deg2rad(azimuth)
+    elevation = np.deg2rad(elevation)
+
+    # Position in Cartesian coordinates
+    x = radius * np.cos(elevation) * np.sin(azimuth)
+    y = radius * np.sin(elevation)
+    z = radius * np.cos(elevation) * np.cos(azimuth)
+    pos = np.array([x, y, z], dtype=np.float32) + center
+
+    # Forward direction (towards center)
+    forward = - (pos - center)
+    forward /= np.linalg.norm(forward)
+
+    # Up direction (assume Y is up)
+    up = np.array([0, 1, 0], dtype=np.float32)
+    
+    # Right direction
+    right = np.cross(up, forward)
+    right /= np.linalg.norm(right)
+
+    # Re-calculate up to ensure orthogonality
+    up = np.cross(forward, right)
+
+    # Camera to World matrix
+    # [R | T]
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, 0] = right
+    pose[:3, 1] = up
+    pose[:3, 2] = forward
+    pose[:3, 3] = pos
+
+    return pose

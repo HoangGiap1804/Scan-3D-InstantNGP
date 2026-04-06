@@ -17,7 +17,7 @@ def sample_pdf(bins, weights, n_samples, det=False):
 
     # Get pdf
     weights = weights + 1e-5  # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    pdf = weights / (torch.sum(weights, -1, keepdim=True) + 1e-8)
     cdf = torch.cumsum(pdf, -1)
     cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
     # Take uniform samples
@@ -70,7 +70,7 @@ class NeRFRenderer(nn.Module):
         super().__init__()
 
         self.bound = bound
-        self.cascade = 1 + math.ceil(math.log2(bound))
+        self.cascade = max(1, 1 + math.ceil(math.log2(bound)))
         self.grid_size = 128
         self.density_scale = density_scale
         self.min_near = min_near
@@ -175,7 +175,7 @@ class NeRFRenderer(nn.Module):
                 deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
 
                 alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T]
-                alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+1]
+                alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-8], dim=-1) # [N, T+1]
                 weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
 
                 # sample new z_vals
@@ -205,7 +205,7 @@ class NeRFRenderer(nn.Module):
         deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
         deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
         alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
-        alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
+        alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-8], dim=-1) # [N, T+t+1]
         weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
 
         dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
@@ -440,7 +440,7 @@ class NeRFRenderer(nn.Module):
                             # add noise in [-hgs, hgs]
                             cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                             # query density
-                            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach().float()
                             sigmas *= self.density_scale
                             # assign 
                             tmp_grid[cas, indices] = sigmas
@@ -469,7 +469,7 @@ class NeRFRenderer(nn.Module):
                 # add noise in [-hgs, hgs]
                 cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                 # query density
-                sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach().float()
                 sigmas *= self.density_scale
                 # assign 
                 tmp_grid[cas, indices] = sigmas
