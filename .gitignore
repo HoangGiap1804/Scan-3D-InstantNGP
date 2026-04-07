@@ -153,7 +153,7 @@ cython_debug/
 .vscode/
 
 # Custom for Scan3D-InstantNGP
-workspace/
+workspace*/
 results/
 trial_*/
 data/*.zip

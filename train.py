@@ -31,7 +31,7 @@ def train(args):
     print(model)
 
     # 2.5 Load Checkpoint
-    ckpt_path = args.ckpt if args.ckpt else os.path.join(workspace, "model_epoch_30.pth") 
+    ckpt_path = args.ckpt if args.ckpt else os.path.join(workspace, "model_epoch_200.pth") 
     start_epoch = 0
     
     # Find the latest epoch checkpoint if model.pth doesn't exist
@@ -67,6 +67,9 @@ def train(args):
     # 3. Optimizer & Scheduler
     optimizer = optim.Adam(model.get_params(lr=args.lr), betas=(0.9, 0.99), eps=1e-8)
     
+    # Initialize AMP GradScaler
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    
     # Continuous decay scheduler
     max_steps = epochs * len(train_loader)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** (iter / max_steps))
@@ -75,6 +78,8 @@ def train(args):
     if os.path.exists(ckpt_path) and isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
         print("Loading optimizer state...")
         optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler'])
     
     # Fast forward scheduler
     for _ in range(global_step):
@@ -107,7 +112,8 @@ def train(args):
 
             # update grid every 16 steps
             if model.cuda_ray and global_step % 16 == 0:
-                model.update_extra_state()
+                with torch.cuda.amp.autocast(enabled=args.fp16):
+                    model.update_extra_state()
             
             # Rendering
             # Note: simplified call, using model.render via NeRFRenderer
@@ -123,21 +129,24 @@ def train(args):
             else:
                 bg_color = 0.0 
             
-            outputs = model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, max_steps=args.max_steps)
-            pred_rgb = outputs['image']
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                outputs = model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, max_steps=args.max_steps)
+                pred_rgb = outputs['image']
+                
+                loss = criterion(pred_rgb, gt_rgb).mean()
             
-            loss = criterion(pred_rgb, gt_rgb).mean()
-            
-            loss.backward()
+            scaler.scale(loss).backward()
             
             # Gradient clipping to prevent NaN
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             
             if torch.isnan(loss):
                 print(f"Warning: NaN detected in loss at step {global_step}, skipping update.")
                 optimizer.zero_grad()
             else:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
             
             epoch_loss += loss.item()
@@ -148,12 +157,13 @@ def train(args):
         print(f"Epoch {epoch} complete, average loss: {epoch_loss/len(train_loader):.6f}")
 
         # Save checkpoint & Render image
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 20 == 0:
             ckpt_path = os.path.join(workspace, f"model_epoch_{epoch+1}.pth")
             state = {
                 'epoch': epoch + 1,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
             }
             torch.save(state, ckpt_path)
             print(f"Saved checkpoint to {ckpt_path}")
@@ -161,7 +171,8 @@ def train(args):
             # End of epoch rendering
             model.eval()
             print(f"Rendering validation image for epoch {epoch}...")
-            image = render_full_image(model, val_pose, val_intrinsics, val_H, val_W, bg_color=0.0, max_steps=args.max_steps)
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                image = render_full_image(model, val_pose, val_intrinsics, val_H, val_W, bg_color=0.0, max_steps=args.max_steps)
             images.append(image)
             
             # Save PNG
@@ -189,6 +200,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_rays', type=int, default=4096, help="Number of rays per batch")
     parser.add_argument('--max_steps', type=int, default=1024, help="Max steps per ray")
     parser.add_argument('--ckpt', type=str, default=None, help="Specific checkpoint to load")
+    parser.add_argument('--fp16', action='store_true', help="Use Automatic Mixed Precision (AMP) for faster training")
     
     args = parser.parse_args()
     
