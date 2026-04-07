@@ -114,7 +114,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
 
 @torch.no_grad()
-def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, **kwargs):
+def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=False, **kwargs):
     ''' render a full image from a pose
     Args:
         model: NeRFRenderer
@@ -122,9 +122,10 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, **kwargs):
         intrinsics: [fl_x, fl_y, cx, cy]
         H, W: int
         bg_color: float, list of 3 floats, or torch.Tensor
+        return_float: if True, returns float32 numpy array [0, 1], else uint8.
         **kwargs: additional arguments for model.render
     Returns:
-        image: [H, W, 3], uint8
+        image: [H, W, 3], uint8 or float32
     '''
     device = pose.device
     rays = get_rays(pose, intrinsics, H, W)
@@ -132,14 +133,17 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, **kwargs):
     rays_d = rays['rays_d']
     
     # staged rendering for full image to avoid OOM
-    outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
-    image = outputs['image'].reshape(H, W, 3)
+    with torch.cuda.amp.autocast(enabled=True):
+        outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
+        image = outputs['image'].reshape(H, W, 3)
+        
+        # convert linear to srgb
+        image = linear_to_srgb(image)
+        
+    if return_float:
+        return image.cpu().numpy()
     
-    # convert linear to srgb
-    image = linear_to_srgb(image)
-    image = (image.cpu().numpy() * 255).astype(np.uint8)
-    
-    return image
+    return (image.cpu().numpy() * 255).astype(np.uint8)
 
 
 def save_video(images, path, fps=10):
@@ -184,25 +188,25 @@ def get_orbit_pose(azimuth, elevation, radius, center=np.array([0, 0, 0], dtype=
     z = radius * np.cos(elevation) * np.cos(azimuth)
     pos = np.array([x, y, z], dtype=np.float32) + center
 
-    # Forward direction (towards center)
-    forward = - (pos - center)
+    # Forward direction (towards center, OpenCV +Z points into screen)
+    forward = center - pos
     forward /= np.linalg.norm(forward)
 
-    # Up direction (assume Y is up)
-    up = np.array([0, 1, 0], dtype=np.float32)
+    # World Up direction (assume Y is up)
+    world_up = np.array([0, 1, 0], dtype=np.float32)
     
-    # Right direction
-    right = np.cross(up, forward)
+    # Right direction (OpenCV +X)
+    right = np.cross(forward, world_up)
     right /= np.linalg.norm(right)
 
-    # Re-calculate up to ensure orthogonality
-    up = np.cross(forward, right)
+    # Down direction to match OpenCV camera (OpenCV +Y points down)
+    down = np.cross(forward, right)
 
     # Camera to World matrix
     # [R | T]
     pose = np.eye(4, dtype=np.float32)
     pose[:3, 0] = right
-    pose[:3, 1] = up
+    pose[:3, 1] = down
     pose[:3, 2] = forward
     pose[:3, 3] = pos
 

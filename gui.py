@@ -32,7 +32,16 @@ class GUI:
         self.upsample_steps = 128
         self.model = None
         self.image = np.zeros((H, W, 4), dtype=np.float32)
+        self.image[..., 3] = 1.0 # Set opaque alpha once
         self.intrinsics = None
+        
+        # Thread safety flags
+        self.new_image_ready = False
+        self.current_fps = 0.0
+        
+        # Interaction state
+        self.is_moving = False
+        self.running = True
         
         # Load model and potentially intrinsics
         self.load_model(ckpt_path)
@@ -124,9 +133,9 @@ class GUI:
             dpg.add_separator()
             
             dpg.add_text("Camera Controls")
-            dpg.add_slider_float(label="Azimuth", min_value=0, max_value=360, default_value=self.azimuth, callback=self.set_azimuth)
-            dpg.add_slider_float(label="Elevation", min_value=-90, max_value=90, default_value=self.elevation, callback=self.set_elevation)
-            dpg.add_slider_float(label="Radius", min_value=0.1, max_value=10.0, default_value=self.radius, callback=self.set_radius)
+            dpg.add_slider_float(label="Azimuth", min_value=0, max_value=360, default_value=self.azimuth, callback=self.set_azimuth, tag="_azimuth_slider")
+            dpg.add_slider_float(label="Elevation", min_value=-90, max_value=90, default_value=self.elevation, callback=self.set_elevation, tag="_elevation_slider")
+            dpg.add_slider_float(label="Radius", min_value=0.1, max_value=10.0, default_value=self.radius, callback=self.set_radius, tag="_radius_slider")
             
             dpg.add_separator()
             dpg.add_text("Rendering Options")
@@ -146,6 +155,9 @@ class GUI:
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("_primary_window", True)
+        
+        with dpg.handler_registry():
+            dpg.add_mouse_wheel_handler(callback=self.on_mouse_wheel)
 
     # Callbacks
     def set_azimuth(self, sender, data): self.azimuth = data; self.need_update = True
@@ -156,9 +168,64 @@ class GUI:
     def set_upsample_steps(self, sender, data): self.upsample_steps = data; self.need_update = True
     def force_update(self, sender, data): self.need_update = True
 
+    def on_mouse_wheel(self, sender, app_data):
+        if dpg.is_item_hovered("_primary_window"):
+            self.radius -= app_data * 0.5
+            self.radius = np.clip(self.radius, 0.1, 10.0)
+            dpg.set_value("_radius_slider", self.radius)
+            self.need_update = True
+            self.is_moving = False
+
     def render_loop(self):
-        last_time = time.time()
+        self.render_thread = threading.Thread(target=self._render_worker, daemon=True)
+        self.render_thread.start()
+        
+        mouse_last_pos = (0, 0)
+        mouse_was_down = False
+        
         while dpg.is_dearpygui_running():
+            # Mouse drag interaction
+            is_down = dpg.is_mouse_button_down(dpg.mvMouseButton_Left)
+            is_hovered = dpg.is_item_hovered("_primary_window")
+            
+            if is_down and (is_hovered or mouse_was_down):
+                mouse_pos = dpg.get_mouse_pos(local=False)
+                if mouse_was_down:
+                    dx = mouse_pos[0] - mouse_last_pos[0]
+                    dy = mouse_pos[1] - mouse_last_pos[1]
+                    if dx != 0 or dy != 0:
+                        self.azimuth += dx * 0.5
+                        self.elevation += dy * 0.5
+                        self.elevation = np.clip(self.elevation, -89.0, 89.0)
+                        dpg.set_value("_azimuth_slider", self.azimuth)
+                        dpg.set_value("_elevation_slider", self.elevation)
+                        self.is_moving = True
+                        self.need_update = True
+                mouse_last_pos = mouse_pos
+                mouse_was_down = True
+            else:
+                if mouse_was_down:
+                    # Mouse released, trigger high quality render
+                    self.is_moving = False
+                    self.need_update = True
+                mouse_was_down = False
+            
+            # Thread-safe UI update
+            if self.new_image_ready:
+                dpg.set_value("_texture", self.image.flatten())
+                if self.current_fps > 0:
+                    dpg.set_value(self.fps_text, f"FPS: {self.current_fps:.2f}")
+                self.new_image_ready = False
+            
+            dpg.render_dearpygui_frame()
+
+        self.running = False
+        self.render_thread.join()
+        dpg.destroy_context()
+
+    def _render_worker(self):
+        last_time = time.time()
+        while self.running:
             if self.need_update:
                 self.need_update = False
                 
@@ -166,43 +233,35 @@ class GUI:
                 pose = get_orbit_pose(self.azimuth, self.elevation, self.radius, self.center)
                 pose = torch.from_numpy(pose).unsqueeze(0).to(self.device)
                 
-                # Mock intrinsics (matching train.py setup or typical values)
-                # In a real app, these should come from the dataset/config
-                fl = self.W  # Default 90 deg FOV if W=H
-                intrinsics = np.array([fl, fl, self.W / 2, self.H / 2])
+                fl = self.W  # Default FOV if unspecified
+                intrinsics = self.intrinsics if self.intrinsics is not None else np.array([fl, fl, self.W / 2, self.H / 2])
                 
-                # Render
+                # Dynamic rendering quality
+                current_steps = 16 if self.is_moving else self.num_steps
+                current_upsample = 0 if self.is_moving else self.upsample_steps
+                
+                # Render using float32 directly
                 with torch.no_grad():
-                    # Use quality parameters
-                    image_uint8 = render_full_image(
-                        self.model, pose, self.intrinsics, self.H, self.W, 
-                        bg_color=self.bg_color, 
-                        num_steps=self.num_steps, 
-                        upsample_steps=self.upsample_steps
+                    image_float = render_full_image(
+                        self.model, pose, intrinsics, self.H, self.W, 
+                        bg_color=self.bg_color,
+                        return_float=True,
+                        num_steps=current_steps, 
+                        upsample_steps=current_upsample
                     )
                     
-                # Fix flipped image (vertical and horizontal flip)
-                image_uint8 = np.flipud(np.fliplr(image_uint8))
-                
-                # Update texture (convert uint8 to float32 [0, 1] for DPG)
-                image_float = image_uint8.astype(np.float32) / 255.0
-                
-                # Convert RGB to RGBA for DPG (RGBA expects 4 floats per pixel)
-                rgba = np.zeros((self.H, self.W, 4), dtype=np.float32)
-                rgba[..., :3] = image_float
-                rgba[..., 3] = 1.0 # Opaque alpha
-                
-                dpg.set_value("_texture", rgba.flatten())
+                # Update texture without creating new numpy array
+                self.image[..., :3] = image_float
                 
                 # FPS update
                 now = time.time()
-                fps = 1.0 / (now - last_time)
+                self.current_fps = 1.0 / (now - last_time)
                 last_time = now
-                dpg.set_value(self.fps_text, f"FPS: {fps:.2f}")
-            
-            dpg.render_dearpygui_frame()
-
-        dpg.destroy_context()
+                
+                # Signal main thread to update UI
+                self.new_image_ready = True
+            else:
+                time.sleep(0.005)
 
 if __name__ == "__main__":
     import argparse
