@@ -194,7 +194,7 @@ class GUI:
                     dx = mouse_pos[0] - mouse_last_pos[0]
                     dy = mouse_pos[1] - mouse_last_pos[1]
                     if dx != 0 or dy != 0:
-                        self.azimuth += dx * 0.5
+                        self.azimuth -= dx * 0.5
                         self.elevation += dy * 0.5
                         self.elevation = np.clip(self.elevation, -89.0, 89.0)
                         dpg.set_value("_azimuth_slider", self.azimuth)

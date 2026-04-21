@@ -29,6 +29,10 @@ pkgs.mkShell {
     gcc
     git
     
+    # Video & Image processing
+    ffmpeg
+    colmap
+    
     # Libraries for OpenCV and DearPyGui
     libGL
     libGLU
