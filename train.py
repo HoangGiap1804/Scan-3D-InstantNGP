@@ -98,16 +98,9 @@ def train(args):
     # -------------------------------------------------------------------------
     # 2.5 Load Checkpoint
     # -------------------------------------------------------------------------
-    ckpt_path = args.ckpt if args.ckpt else os.path.join(workspace, "model_epoch_latest.pth")
+    ckpt_path = args.ckpt if args.ckpt else os.path.join(workspace, "model.pth")
     start_epoch = 0
-    checkpoint = None  # Khởi tạo trước để tránh UnboundLocalError
-
-    # Tìm checkpoint mới nhất nếu file chỉ định không tồn tại
-    if not os.path.exists(ckpt_path):
-        ckpts = [f for f in os.listdir(workspace) if f.endswith('.pth')]
-        if ckpts:
-            ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]) if 'epoch' in x else 0)
-            ckpt_path = os.path.join(workspace, ckpts[-1])
+    checkpoint = None
 
     if os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}...")
@@ -121,14 +114,9 @@ def train(args):
         else:
             # Định dạng cũ: chỉ có state_dict
             model.load_state_dict(checkpoint)
-            if 'epoch' in ckpt_path:
-                try:
-                    start_epoch = int(ckpt_path.split('_')[-1].split('.')[0])
-                except ValueError:
-                    start_epoch = 0
         print(f"Resuming from epoch {start_epoch}")
     else:
-        print("No checkpoint found, starting from scratch.")
+        print(f"No checkpoint found at {ckpt_path}, starting from scratch.")
 
     print("Starting training...")
     epochs = args.epochs
@@ -257,7 +245,7 @@ def train(args):
         # Save checkpoint & Render validation images
         # ---------------------------------------------------------------------
         if (epoch + 1) % args.save_interval == 0:
-            ckpt_save_path = os.path.join(workspace, f"model_epoch_{epoch+1}.pth")
+            ckpt_save_path = os.path.join(workspace, "model.pth")
             state = {
                 'epoch': epoch + 1,
                 'model': model.state_dict(),
@@ -266,8 +254,6 @@ def train(args):
                 'ema': ema.state_dict(),
             }
             torch.save(state, ckpt_save_path)
-            # Ghi đè latest để dễ resume
-            torch.save(state, os.path.join(workspace, "model_epoch_latest.pth"))
             print(f"Saved checkpoint to {ckpt_save_path}")
 
             # Render validation image (dùng EMA weights để ảnh mượt hơn)

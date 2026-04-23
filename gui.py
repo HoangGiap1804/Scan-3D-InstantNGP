@@ -56,11 +56,20 @@ class GUI:
         self.model = NeRFNetwork(bound=0.5, cuda_ray=True).to(self.device).eval()
         
         if ckpt_path is None:
-            # Find latest checkpoint in workspace
-            ckpts = [f for f in os.listdir(self.workspace) if f.endswith('.pth')]
-            if ckpts:
-                ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]) if 'epoch' in x else 0)
-                ckpt_path = os.path.join(self.workspace, ckpts[-1])
+            # Ưu tiên tìm model.pth
+            ckpt_path = os.path.join(self.workspace, "model.pth")
+            
+            # Nếu không có model.pth mới tìm các file .pth khác
+            if not os.path.exists(ckpt_path):
+                ckpts = [f for f in os.listdir(self.workspace) if f.endswith('.pth')]
+                if ckpts:
+                    def get_epoch(name):
+                        try:
+                            return int(name.split('_')[-1].split('.')[0])
+                        except ValueError:
+                            return 999999
+                    ckpts.sort(key=get_epoch)
+                    ckpt_path = os.path.join(self.workspace, ckpts[-1])
         
         if ckpt_path and os.path.exists(ckpt_path):
             print(f"Loading checkpoint from {ckpt_path}...")

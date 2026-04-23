@@ -51,7 +51,7 @@ pip install -r requirements.txt
 Để bắt đầu huấn luyện với tập dữ liệu của bạn, sử dụng lệnh sau:
 
 ```bash
-python train.py --path ./data/fox --workspace workspace_fox --epochs 200
+python train.py --path ./data/fox --workspace workspace_fox --epochs 200 --bound 0.5 --fp16 
 ```
 
 Các tham số chính:

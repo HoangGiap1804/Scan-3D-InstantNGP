@@ -137,9 +137,6 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=
         outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
         image = outputs['image'].reshape(H, W, 3)
         
-        # convert linear to srgb
-        image = linear_to_srgb(image)
-        
     if return_float:
         return image.cpu().numpy()
     
