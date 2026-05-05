@@ -5,6 +5,11 @@ import cv2
 import dearpygui.dearpygui as dpg
 import threading
 import time
+import asyncio
+import websockets
+import base64
+import json
+import queue
 
 from model import NeRFNetwork
 from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
@@ -47,6 +52,15 @@ class GUI:
         self.load_model(ckpt_path)
         self.try_load_intrinsics()
         
+        # WebSocket state
+        self.clients = set()
+        self.ws_queue = queue.Queue(maxsize=2) # Keep queue small to avoid lag
+        self.loop = None
+        
+        # Start WebSocket server thread
+        self.ws_thread = threading.Thread(target=self._start_ws_server, daemon=True)
+        self.ws_thread.start()
+
         # DearPyGui Setup
         dpg.create_context()
         self.setup_dpg()
@@ -185,6 +199,71 @@ class GUI:
             self.need_update = True
             self.is_moving = False
 
+    def _start_ws_server(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        async def handler(websocket):
+            self.clients.add(websocket)
+            print(f"[WS] Client connected. Total: {len(self.clients)}")
+            try:
+                # Lắng nghe tin nhắn từ Client
+                async for message in websocket:
+                    try:
+                        data = json.loads(message)
+                        if data.get("type") == "camera":
+                            # Cập nhật thông số camera
+                            if "azimuth" in data: self.azimuth = float(data["azimuth"])
+                            if "elevation" in data: self.elevation = float(data["elevation"])
+                            if "radius" in data: self.radius = float(data["radius"])
+                            
+                            self.need_update = True
+                            
+                            # Đồng bộ ngược lại giao diện DearPyGui (nếu đang mở)
+                            dpg.set_value("_azimuth_slider", self.azimuth)
+                            dpg.set_value("_elevation_slider", self.elevation)
+                            dpg.set_value("_radius_slider", self.radius)
+                    except Exception as e:
+                        print(f"[WS] Error processing message: {e}")
+            except websockets.ConnectionClosed:
+                pass
+            finally:
+                if websocket in self.clients:
+                    self.clients.remove(websocket)
+                print(f"[WS] Client disconnected. Total: {len(self.clients)}")
+
+        async def main():
+            # Khởi tạo server trong async context để tránh lỗi "no running event loop"
+            async with websockets.serve(handler, "0.0.0.0", 8000):
+                print("[WS] Server started on ws://0.0.0.0:8000")
+                # Chạy task broadcast ngay trong loop này
+                await self._ws_broadcast_task()
+
+        try:
+            self.loop.run_until_complete(main())
+        except Exception as e:
+            print(f"[WS] Server error: {e}")
+        finally:
+            self.loop.close()
+
+    async def _ws_broadcast_task(self):
+        while self.running:
+            try:
+                # Lấy dữ liệu từ queue (không block event loop)
+                if not self.ws_queue.empty():
+                    data = await self.loop.run_in_executor(None, self.ws_queue.get)
+                    if self.clients:
+                        # Gửi đến tất cả client đang kết nối
+                        # Sử dụng wait thay vì gather để tránh crash nếu client ngắt kết nối đột ngột
+                        active_clients = list(self.clients)
+                        if active_clients:
+                            await asyncio.wait([asyncio.create_task(client.send(data)) for client in active_clients], timeout=0.1)
+                else:
+                    await asyncio.sleep(0.01) # Tránh chiếm dụng CPU khi queue trống
+            except Exception as e:
+                # print(f"[WS] Broadcast error: {e}")
+                await asyncio.sleep(0.1)
+
     def render_loop(self):
         self.render_thread = threading.Thread(target=self._render_worker, daemon=True)
         self.render_thread.start()
@@ -269,6 +348,25 @@ class GUI:
                 
                 # Signal main thread to update UI
                 self.new_image_ready = True
+
+                # Signal WebSocket to broadcast
+                if self.clients and not self.ws_queue.full():
+                    try:
+                        # Encode to JPEG
+                        img_uint8 = (self.image[..., :3] * 255).astype(np.uint8)
+                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+                        _, buffer = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+                        
+                        # Add metadata
+                        packet = json.dumps({
+                            "image": jpg_as_text,
+                            "fps": self.current_fps,
+                            "res": f"{self.W}x{self.H}"
+                        })
+                        self.ws_queue.put_nowait(packet)
+                    except queue.Full:
+                        pass
             else:
                 time.sleep(0.005)
 

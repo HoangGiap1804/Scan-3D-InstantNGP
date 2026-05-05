@@ -1,7 +1,11 @@
+numpy==1.26.4
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+
 trimesh
 opencv-python
 tensorboardX
-numpy
 pandas
 tqdm
 matplotlib
@@ -14,3 +18,13 @@ torch-ema
 PyMCubes
 pysdf
 dearpygui
+# Build & System
+setuptools==69.5.1
+ninja
+wheel
+# Phụ trợ biên dịch
+Cython
+# Metrics & Processing
+scikit-image
+imageio-ffmpeg
+websockets

@@ -128,7 +128,7 @@ def train(args):
     optimizer = optim.Adam(model.get_params(lr=args.lr), betas=(0.9, 0.99), eps=1e-15)
 
     # FIX: Dùng torch.amp thay vì torch.cuda.amp (tránh deprecated API)
-    scaler = torch.amp.GradScaler('cuda', enabled=args.fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
     # FIX: Thêm min() để clamp LR, tránh LR tiếp tục giảm sau max_steps
     max_steps = epochs * len(train_loader)

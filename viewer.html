@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instant-NGP Live Stream</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --accent-color: #38bdf8;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            position: relative;
+            width: 90vw;
+            max-width: 1000px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(to right, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--card-bg);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+
+        .status-dot.online {
+            background: #10b981;
+            box-shadow: 0 0 10px #10b981;
+        }
+
+        .stream-viewport {
+            position: relative;
+            aspect-ratio: 1 / 1;
+            background: #000;
+            border-radius: 24px;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #stream-img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            transition: opacity 0.2s ease;
+        }
+
+        .info-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            right: 20px;
+            display: flex;
+            gap: 15px;
+            pointer-events: none;
+        }
+
+        .glass-card {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 12px 20px;
+            border-radius: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+
+        .value {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--accent-color);
+        }
+
+        .placeholder-text {
+            position: absolute;
+            color: var(--text-secondary);
+            font-size: 1rem;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Instant-NGP Live</h1>
+            <div class="status-badge">
+                <div id="status-dot" class="status-dot"></div>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </header>
+
+        <div class="stream-viewport">
+            <div id="placeholder" class="placeholder-text">Waiting for stream...</div>
+            <img id="stream-img" src="" style="display: none;" />
+
+            <div class="info-panel">
+                <div class="glass-card">
+                    <span class="label">FPS</span>
+                    <span id="fps-val" class="value">0.00</span>
+                </div>
+                <div class="glass-card">
+                    <span class="label">Resolution</span>
+                    <span id="res-val" class="value">0x0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const img = document.getElementById('stream-img');
+        const viewport = document.querySelector('.stream-viewport');
+        const placeholder = document.getElementById('placeholder');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const fpsVal = document.getElementById('fps-val');
+        const resVal = document.getElementById('res-val');
+
+        // Camera state
+        let azimuth = 0;
+        let elevation = 0;
+        let radius = 4.0;
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        let ws;
+        const sendCameraUpdate = () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: "camera",
+                    azimuth: azimuth,
+                    elevation: elevation,
+                    radius: radius
+                }));
+            }
+        };
+
+        const connect = () => {
+            ws = new WebSocket(`ws://${window.location.hostname || 'localhost'}:8000`);
+            
+            ws.onopen = () => {
+                statusDot.classList.add('online');
+                statusText.innerText = 'Live Streaming';
+                placeholder.style.display = 'none';
+                img.style.display = 'block';
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    img.src = 'data:image/jpeg;base64,' + data.image;
+                    fpsVal.innerText = parseFloat(data.fps).toFixed(2);
+                    resVal.innerText = data.res;
+                } catch (e) {
+                    console.error("Error parsing frame data", e);
+                }
+            };
+
+            ws.onclose = () => {
+                statusDot.classList.remove('online');
+                statusText.innerText = 'Disconnected';
+                placeholder.style.display = 'block';
+                img.style.display = 'none';
+                setTimeout(connect, 2000);
+            };
+        };
+
+        // Input handling
+        viewport.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            viewport.style.cursor = 'grabbing';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            
+            const dx = e.clientX - lastMouseX;
+            const dy = e.clientY - lastMouseY;
+            
+            azimuth -= dx * 0.5;
+            elevation += dy * 0.5;
+            elevation = Math.max(-89, Math.min(89, elevation));
+            
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            
+            sendCameraUpdate();
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+            viewport.style.cursor = 'grab';
+        });
+
+        viewport.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            radius += e.deltaY * 0.005;
+            radius = Math.max(0.1, Math.min(10.0, radius));
+            sendCameraUpdate();
+        }, { passive: false });
+
+        // Initial cursor
+        viewport.style.cursor = 'grab';
+
+        connect();
+    </script>
+</body>
+
+</html>

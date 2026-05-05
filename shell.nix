@@ -83,6 +83,9 @@ pkgs.mkShell {
     export CUDA_HOME=${pkgs.cudaPackages.cuda_nvcc}
     export CUDACXX=${pkgs.cudaPackages.cuda_nvcc}/bin/nvcc
 
+    # GPU arch (RTX 2050)
+    export TCNN_CUDA_ARCHITECTURES=86
+
     export CC=$(which gcc)
     export CXX=$(which g++)
     export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
