@@ -10,9 +10,6 @@ from provider import NeRFDataset
 from utils import seed_everything, render_full_image, save_video
 import cv2
 
-# ---------------------------------------------------------------------------
-# Simple PSNR meter (không cần import thêm)
-# ---------------------------------------------------------------------------
 class PSNRMeter:
     def __init__(self):
         self.reset()
@@ -35,10 +32,6 @@ class PSNRMeter:
     def report(self):
         return f"PSNR = {self.measure():.2f} dB"
 
-
-# ---------------------------------------------------------------------------
-# EMA (Exponential Moving Average) helper — giống torch-ngp
-# ---------------------------------------------------------------------------
 class EMA:
     def __init__(self, model, decay=0.95):
         self.decay = decay
@@ -63,10 +56,6 @@ class EMA:
     def load_state_dict(self, state_dict):
         self.shadow = {k: v.clone() for k, v in state_dict.items()}
 
-
-# ---------------------------------------------------------------------------
-# Main training function
-# ---------------------------------------------------------------------------
 def train(args):
     # Configuration
     path = args.path
@@ -122,13 +111,25 @@ def train(args):
     epochs = args.epochs
     global_step = start_epoch * len(train_loader)
 
-    # -------------------------------------------------------------------------
-    # 3. Optimizer & Scheduler
+    # 3. Optimizer & Scaler
     # -------------------------------------------------------------------------
     optimizer = optim.Adam(model.get_params(lr=args.lr), betas=(0.9, 0.99), eps=1e-15)
 
     # FIX: Dùng torch.amp thay vì torch.cuda.amp (tránh deprecated API)
     scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+
+    # Load optimizer & scaler state nếu có (PHẢI TRƯỚC KHI TẠO SCHEDULER)
+    if checkpoint is not None and isinstance(checkpoint, dict):
+        if 'optimizer' in checkpoint:
+            print("Loading optimizer state...")
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler'])
+
+    # FIX: Đảm bảo có initial_lr trong mỗi param_group để tránh KeyError khi resume
+    for group in optimizer.param_groups:
+        if 'initial_lr' not in group:
+            group['initial_lr'] = args.lr
 
     # FIX: Thêm min() để clamp LR, tránh LR tiếp tục giảm sau max_steps
     max_steps = epochs * len(train_loader)
@@ -138,14 +139,6 @@ def train(args):
         # FIX: last_epoch=global_step thay thế vòng lặp fast-forward
         last_epoch=global_step - 1 if global_step > 0 else -1,
     )
-
-    # Load optimizer & scaler state nếu có
-    if checkpoint is not None and isinstance(checkpoint, dict):
-        if 'optimizer' in checkpoint:
-            print("Loading optimizer state...")
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scaler' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler'])
 
     # -------------------------------------------------------------------------
     # 4. Training Loop
