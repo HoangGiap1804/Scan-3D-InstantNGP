@@ -9,6 +9,8 @@ import asyncio
 import websockets
 import base64
 import json
+import socket
+import qrcode
 import queue
 
 from model import NeRFNetwork
@@ -55,6 +57,7 @@ class GUI:
         # WebSocket state
         self.clients = set()
         self.ws_queue = queue.Queue(maxsize=2) # Keep queue small to avoid lag
+        self.last_packet = None
         self.loop = None
         
         # Start WebSocket server thread
@@ -203,9 +206,42 @@ class GUI:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         
+        # Get local IP for QR code
+        def get_local_ip():
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(('8.8.8.8', 80))
+                ip = s.getsockname()[0]
+            except Exception:
+                ip = '127.0.0.1'
+            finally:
+                s.close()
+            return ip
+
+        local_ip = get_local_ip()
+        port = 8000
+        server_url = f"ws://{local_ip}:{port}"
+        
+        print(f"\n" + "="*50)
+        print(f"[WS] Server Address: {server_url}")
+        try:
+            qr = qrcode.QRCode(version=1, box_size=1, border=1)
+            qr.add_data(server_url)
+            qr.make(fit=True)
+            print("[WS] Scan QR code to connect:")
+            qr.print_ascii(invert=True)
+        except Exception as e:
+            print(f"[WS] Could not generate QR code: {e}")
+        print("="*50 + "\n")
+
         async def handler(websocket):
             self.clients.add(websocket)
             print(f"[WS] Client connected. Total: {len(self.clients)}")
+            
+            # Gửi ảnh mới nhất ngay khi kết nối
+            if self.last_packet:
+                await websocket.send(self.last_packet)
+
             try:
                 # Lắng nghe tin nhắn từ Client
                 async for message in websocket:
@@ -223,6 +259,10 @@ class GUI:
                             dpg.set_value("_azimuth_slider", self.azimuth)
                             dpg.set_value("_elevation_slider", self.elevation)
                             dpg.set_value("_radius_slider", self.radius)
+
+                            # Gửi ngay ảnh hiện tại để phản hồi nhanh
+                            if self.last_packet:
+                                await websocket.send(self.last_packet)
                     except Exception as e:
                         print(f"[WS] Error processing message: {e}")
             except websockets.ConnectionClosed:
@@ -349,8 +389,8 @@ class GUI:
                 # Signal main thread to update UI
                 self.new_image_ready = True
 
-                # Signal WebSocket to broadcast
-                if self.clients and not self.ws_queue.full():
+                # Signal WebSocket to broadcast (Encode if clients connected OR if no packet exists yet)
+                if (self.clients or self.last_packet is None) and not self.ws_queue.full():
                     try:
                         # Encode to JPEG
                         img_uint8 = (self.image[..., :3] * 255).astype(np.uint8)
@@ -360,11 +400,15 @@ class GUI:
                         
                         # Add metadata
                         packet = json.dumps({
+                            "type": "image",
+                            "signature": "InstantNGP",
                             "image": jpg_as_text,
                             "fps": self.current_fps,
                             "res": f"{self.W}x{self.H}"
                         })
-                        self.ws_queue.put_nowait(packet)
+                        self.last_packet = packet
+                        if self.clients:
+                            self.ws_queue.put_nowait(packet)
                     except queue.Full:
                         pass
             else:

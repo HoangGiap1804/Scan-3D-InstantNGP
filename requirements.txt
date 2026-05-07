@@ -28,3 +28,4 @@ Cython
 scikit-image
 imageio-ffmpeg
 websockets
+qrcode

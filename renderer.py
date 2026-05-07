@@ -320,10 +320,7 @@ class NeRFRenderer(nn.Module):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 
-        if self.cuda_ray:
-            _run = self.run_cuda
-        else:
-            _run = self.run
+        _run = self.run_cuda
 
         B, N = rays_o.shape[:2]
         device = rays_o.device
