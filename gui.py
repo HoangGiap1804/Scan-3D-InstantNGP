@@ -12,6 +12,11 @@ import json
 import socket
 import qrcode
 import queue
+import shutil
+import subprocess
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 from model import NeRFNetwork
 from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
@@ -219,21 +224,57 @@ class GUI:
             return ip
 
         local_ip = get_local_ip()
-        port = 8000
-        server_url = f"ws://{local_ip}:{port}"
+        ws_port = getattr(self, 'port_ws', 8000)
+        http_port = getattr(self, 'port_http', 8081) # Mặc định đổi sang 8081 để tránh trùng server.py
+        
+        server_url = f"ws://{local_ip}:{ws_port}"
+        upload_url = f"http://{local_ip}:{http_port}/upload"
         
         print(f"\n" + "="*50)
-        print(f"[WS] Server Address: {server_url}")
+        print(f"THÔNG TIN KẾT NỐI SERVER")
+        print(f"Viewer (WS): {server_url}")
+        print(f"Upload (HTTP): {upload_url}")
+        print(f"-"*50)
         try:
             qr = qrcode.QRCode(version=1, box_size=1, border=1)
-            qr.add_data(server_url)
+            qr.add_data(local_ip) # Chỉ chứa địa chỉ IP
             qr.make(fit=True)
-            print("[WS] Scan QR code to connect:")
+            print(f"Quét mã QR để lấy IP Server ({local_ip}):")
             qr.print_ascii(invert=True)
         except Exception as e:
-            print(f"[WS] Could not generate QR code: {e}")
+            print(f"Could not generate QR code: {e}")
         print("="*50 + "\n")
 
+        # --- FastAPI Setup for Video Upload ---
+        app = FastAPI()
+        app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+        @app.post("/upload")
+        async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+            # Tạo tên thư mục dựa trên tên file (bỏ đuôi) + timestamp
+            video_name = os.path.splitext(file.filename)[0]
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            unique_folder = f"{video_name}_{timestamp}"
+            
+            # Thư mục cụ thể cho upload này: videos/video_name_timestamp/
+            target_dir = os.path.join("videos", unique_folder)
+            os.makedirs(target_dir, exist_ok=True)
+            
+            file_path = os.path.join(target_dir, file.filename)
+            
+            print(f"[UPLOAD] Nhận video: {file.filename} -> Lưu vào: {target_dir}")
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            
+            # background_tasks.add_task(self._process_uploaded_video, file_path, target_dir) # Tắt tự động xử lý
+            
+            return {
+                "message": "Video uploaded successfully and saved to unique folder",
+                "folder": unique_folder,
+                "filename": file.filename
+            }
+
+        # --- WebSocket Handler ---
         async def handler(websocket):
             self.clients.add(websocket)
             print(f"[WS] Client connected. Total: {len(self.clients)}")
@@ -273,18 +314,58 @@ class GUI:
                 print(f"[WS] Client disconnected. Total: {len(self.clients)}")
 
         async def main():
-            # Khởi tạo server trong async context để tránh lỗi "no running event loop"
-            async with websockets.serve(handler, "0.0.0.0", 8000):
-                print("[WS] Server started on ws://0.0.0.0:8000")
-                # Chạy task broadcast ngay trong loop này
-                await self._ws_broadcast_task()
+            # Chạy song song cả WebSocket Server và FastAPI Server
+            ws_server = websockets.serve(handler, "0.0.0.0", ws_port)
+            
+            # Cấu hình uvicorn chạy trong cùng loop
+            config = uvicorn.Config(app, host="0.0.0.0", port=http_port, log_level="error")
+            http_server = uvicorn.Server(config)
+
+            print(f"[SERVER] WebSocket chạy tại cổng {ws_port}")
+            print(f"[SERVER] HTTP Upload chạy tại cổng {http_port}")
+
+            await asyncio.gather(
+                ws_server,
+                http_server.serve(),
+                self._ws_broadcast_task()
+            )
 
         try:
             self.loop.run_until_complete(main())
         except Exception as e:
-            print(f"[WS] Server error: {e}")
+            print(f"[SERVER] Error: {e}")
         finally:
             self.loop.close()
+
+    def _process_uploaded_video(self, video_path, target_dir):
+        """Hàm xử lý video chạy ngầm: COLMAP -> Train"""
+        print(f"[PROCESS] Đang xử lý COLMAP trong thư mục: {target_dir}")
+        try:
+            # 1. Chạy colmap2nerf (Kết quả ảnh sẽ nằm trong target_dir/images)
+            subprocess.run([
+                "python", "scripts/colmap2nerf.py", 
+                "--video", video_path, 
+                "--run_colmap", 
+                "--video_fps", "2"
+            ], check=True)
+            
+            # 2. Tự động bắt đầu training
+            # Script colmap2nerf sẽ tạo thư mục images cùng cấp với video
+            data_path = target_dir 
+            print(f"[PROCESS] COLMAP xong. Bắt đầu training dữ liệu tại: {data_path}")
+            
+            subprocess.run([
+                "python", "train.py", 
+                "--path", data_path, 
+                "--workspace", self.workspace, 
+                "--epochs", "50", 
+                "--fp16"
+            ], check=True)
+            
+            print(f"[PROCESS] Hoàn tất! Dữ liệu đã được tích hợp vào {self.workspace}")
+            self.need_update = True
+        except Exception as e:
+            print(f"[PROCESS] Lỗi khi xử lý: {e}")
 
     async def _ws_broadcast_task(self):
         while self.running:
@@ -422,7 +503,13 @@ if __name__ == "__main__":
     parser.add_argument('--res', type=int, default=400, help="Render resolution")
     parser.add_argument('--display', type=int, default=None, help="Display resolution (upscale)")
     parser.add_argument('--angle', type=float, default=None, help="Camera angle x (FOV) override")
+    parser.add_argument('--port_ws', type=int, default=8000)
+    parser.add_argument('--port_http', type=int, default=8081)
     args = parser.parse_args()
+    
+    # Pass ports to GUI
+    GUI.port_ws = args.port_ws
+    GUI.port_http = args.port_http
 
     gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, camera_angle_x=args.angle, display_res=args.display)
     gui.render_loop()

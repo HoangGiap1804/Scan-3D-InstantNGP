@@ -29,3 +29,7 @@ scikit-image
 imageio-ffmpeg
 websockets
 qrcode
+
+fastapi
+uvicorn
+python-multipart

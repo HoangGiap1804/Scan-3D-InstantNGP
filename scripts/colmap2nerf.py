@@ -36,9 +36,11 @@ def parse_args():
 
     parser.add_argument("--colmap_matcher", default="exhaustive", choices=["exhaustive","sequential","spatial","transitive","vocab_tree"], help="select which matcher colmap should use. sequential for videos, exhaustive for adhoc images")
     parser.add_argument("--skip_early", default=0, help="skip this many images from the start")
+    parser.add_argument("--size", default="", help="resize images to a specific size, e.g. 800x800 or 800:-1 (keep aspect ratio)")
 
     parser.add_argument("--colmap_text", default="colmap_text", help="input path to the colmap text files (set automatically if run_colmap is used)")
     parser.add_argument("--colmap_db", default="colmap.db", help="colmap database filename")
+    parser.add_argument("--yes", action="store_true", help="do not ask for confirmation")
 
     args = parser.parse_args()
     return args
@@ -58,7 +60,7 @@ def run_ffmpeg(args):
     fps = float(args.video_fps) or 1.0
 
     print(f"running ffmpeg with input video file={video}, output image folder={images}, fps={fps}.")
-    if (input(f"warning! folder '{images}' will be deleted/replaced. continue? (Y/n)").lower().strip()+"y")[:1] != "y":
+    if not args.yes and (input(f"warning! folder '{images}' will be deleted/replaced. continue? (Y/n)").lower().strip()+"y")[:1] != "y":
         sys.exit(1)
 
     try:
@@ -74,7 +76,17 @@ def run_ffmpeg(args):
         start, end = time_slice.split(",")
         time_slice_value = f",select='between(t\,{start}\,{end})'"
 
-    do_system(f"ffmpeg -i {video} -qscale:v 1 -qmin 1 -vf \"fps={fps}{time_slice_value}\" {images}/%04d.jpg")
+    size_value = ""
+    size_value = ""
+    if args.size:
+        # Tách width và height (ví dụ 800x800 -> 800:800)
+        w, h = args.size.replace('x', ':').split(':')
+        # Logic: 
+        # 1. Scale sao cho phủ kín kích thước mục tiêu (force_original_aspect_ratio=increase)
+        # 2. Crop lấy vùng trung tâm chính xác
+        size_value = f",scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+
+    do_system(f"ffmpeg -i {video} -qscale:v 1 -qmin 1 -vf \"fps={fps}{time_slice_value}{size_value}\" {images}/%04d.jpg")
 
 def run_colmap(args):
     db = args.colmap_db
@@ -86,7 +98,7 @@ def run_colmap(args):
     sparse = db_noext + "_sparse"
 
     print(f"running colmap with:\n\tdb={db}\n\timages={images}\n\tsparse={sparse}\n\ttext={text}")
-    if (input(f"warning! folders '{sparse}' and '{text}' will be deleted/replaced. continue? (Y/n)").lower().strip()+"y")[:1] != "y":
+    if not args.yes and (input(f"warning! folders '{sparse}' and '{text}' will be deleted/replaced. continue? (Y/n)").lower().strip()+"y")[:1] != "y":
         sys.exit(1)
     if os.path.exists(db):
         os.remove(db)

@@ -166,3 +166,5 @@ data/*.7z
 */build/
 
 data/
+videos/
+jobs.db

@@ -164,6 +164,21 @@ def train(args):
         model.mark_untrained_grid(train_dataset.poses, train_dataset.intrinsics)
 
     for epoch in range(start_epoch, epochs):
+        # External Control: Check for stop flag
+        stop_flag = os.path.join(workspace, "stop.flag")
+        if os.path.exists(stop_flag):
+            print(f"External Stop signal detected at {stop_flag}. Exiting training...")
+            os.remove(stop_flag)
+            break
+            
+        # External Control: Check for manual save flag
+        save_flag = os.path.join(workspace, "save.flag")
+        force_save = False
+        if os.path.exists(save_flag):
+            print(f"External Save signal detected at {save_flag}.")
+            force_save = True
+            os.remove(save_flag)
+
         pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}")
         epoch_loss = 0.0
         psnr_meter.reset()
@@ -237,7 +252,7 @@ def train(args):
         # ---------------------------------------------------------------------
         # Save checkpoint & Render validation images
         # ---------------------------------------------------------------------
-        if (epoch + 1) % args.save_interval == 0:
+        if (epoch + 1) % args.save_interval == 0 or force_save:
             ckpt_save_path = os.path.join(workspace, "model.pth")
             state = {
                 'epoch': epoch + 1,
@@ -291,9 +306,9 @@ if __name__ == "__main__":
     parser.add_argument('--workspace', type=str, default='workspace', help="Workspace directory")
     parser.add_argument('--seed', type=int, default=42, help="Random seed")
     parser.add_argument('--lr', type=float, default=1e-2, help="Initial learning rate")
-    parser.add_argument('--bound', type=float, default=2.0, help="Scene bound")
+    parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
     parser.add_argument('--epochs', type=int, default=100, help="Total epochs")
-    parser.add_argument('--num_rays', type=int, default=4096, help="Number of rays per batch")
+    parser.add_argument('--num_rays', type=int, default=2048, help="Number of rays per batch")
     parser.add_argument('--max_steps', type=int, default=1024, help="Max steps per ray (cuda_ray)")
     parser.add_argument('--ckpt', type=str, default=None, help="Specific checkpoint path to load")
     parser.add_argument('--fp16', action='store_true', help="Use AMP (fp16) for faster training")
