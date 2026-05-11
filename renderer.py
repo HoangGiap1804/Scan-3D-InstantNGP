@@ -143,7 +143,8 @@ class NeRFRenderer(nn.Module):
                     break
 
                 # decide compact_steps
-                n_step = max(min(N // n_alive, 8), 1)
+                # Increase n_step to reduce Python overhead (number of while loops)
+                n_step = max(min(N // n_alive, 64), 1)
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 

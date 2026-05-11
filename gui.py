@@ -4,6 +4,7 @@ import os
 import cv2
 import dearpygui.dearpygui as dpg
 import threading
+import queue
 import time
 import asyncio
 import websockets
@@ -11,12 +12,6 @@ import base64
 import json
 import socket
 import qrcode
-import queue
-import shutil
-import subprocess
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 
 from model import NeRFNetwork
 from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
@@ -42,6 +37,8 @@ class GUI:
         self.bg_color = 0.0
         self.num_steps = 128
         self.upsample_steps = 128
+        self.t_thresh = 0.001 # Ngưỡng dừng tia (Tăng để nhanh hơn)
+        self.dt_gamma = 0     # Bước nhảy thích ứng
         self.model = None
         self.image = np.zeros((H, W, 4), dtype=np.float32)
         self.image[..., 3] = 1.0 # Set opaque alpha once
@@ -51,8 +48,14 @@ class GUI:
         self.new_image_ready = False
         self.current_fps = 0.0
         
+        # Background Encoder Queue
+        self.encode_queue = queue.Queue(maxsize=1)
+        self.encoder_thread = threading.Thread(target=self._encoder_worker, daemon=True)
+        self.encoder_thread.start()
+        
         # Interaction state
         self.is_moving = False
+        self.last_move_time = 0
         self.running = True
         
         # Load model and potentially intrinsics
@@ -173,6 +176,8 @@ class GUI:
             dpg.add_slider_float(label="Background Color", min_value=0.0, max_value=1.0, default_value=self.bg_color, callback=self.set_bg_color)
             dpg.add_slider_int(label="Steps", min_value=16, max_value=1024, default_value=self.num_steps, callback=self.set_steps)
             dpg.add_slider_int(label="Upsample Steps", min_value=0, max_value=512, default_value=self.upsample_steps, callback=self.set_upsample_steps)
+            dpg.add_slider_float(label="T Thresh", min_value=0.0, max_value=0.1, format="%.4f", default_value=self.t_thresh, callback=self.set_t_thresh)
+            dpg.add_slider_float(label="dt Gamma", min_value=0.0, max_value=0.1, format="%.4f", default_value=self.dt_gamma, callback=self.set_dt_gamma)
             dpg.add_button(label="Force Update", callback=self.force_update)
             
             dpg.add_separator()
@@ -197,6 +202,8 @@ class GUI:
     def set_bg_color(self, sender, data): self.bg_color = data; self.need_update = True
     def set_steps(self, sender, data): self.num_steps = data; self.need_update = True
     def set_upsample_steps(self, sender, data): self.upsample_steps = data; self.need_update = True
+    def set_t_thresh(self, sender, data): self.t_thresh = data; self.need_update = True
+    def set_dt_gamma(self, sender, data): self.dt_gamma = data; self.need_update = True
     def force_update(self, sender, data): self.need_update = True
 
     def on_mouse_wheel(self, sender, app_data):
@@ -205,7 +212,8 @@ class GUI:
             self.radius = np.clip(self.radius, 0.1, 10.0)
             dpg.set_value("_radius_slider", self.radius)
             self.need_update = True
-            self.is_moving = False
+            self.is_moving = True
+            self.last_move_time = time.time()
 
     def _start_ws_server(self):
         self.loop = asyncio.new_event_loop()
@@ -225,15 +233,12 @@ class GUI:
 
         local_ip = get_local_ip()
         ws_port = getattr(self, 'port_ws', 8000)
-        http_port = getattr(self, 'port_http', 8081) # Mặc định đổi sang 8081 để tránh trùng server.py
         
         server_url = f"ws://{local_ip}:{ws_port}"
-        upload_url = f"http://{local_ip}:{http_port}/upload"
         
         print(f"\n" + "="*50)
         print(f"THÔNG TIN KẾT NỐI SERVER")
         print(f"Viewer (WS): {server_url}")
-        print(f"Upload (HTTP): {upload_url}")
         print(f"-"*50)
         try:
             qr = qrcode.QRCode(version=1, box_size=1, border=1)
@@ -244,35 +249,6 @@ class GUI:
         except Exception as e:
             print(f"Could not generate QR code: {e}")
         print("="*50 + "\n")
-
-        # --- FastAPI Setup for Video Upload ---
-        app = FastAPI()
-        app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-        @app.post("/upload")
-        async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-            # Tạo tên thư mục dựa trên tên file (bỏ đuôi) + timestamp
-            video_name = os.path.splitext(file.filename)[0]
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            unique_folder = f"{video_name}_{timestamp}"
-            
-            # Thư mục cụ thể cho upload này: videos/video_name_timestamp/
-            target_dir = os.path.join("videos", unique_folder)
-            os.makedirs(target_dir, exist_ok=True)
-            
-            file_path = os.path.join(target_dir, file.filename)
-            
-            print(f"[UPLOAD] Nhận video: {file.filename} -> Lưu vào: {target_dir}")
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
-            # background_tasks.add_task(self._process_uploaded_video, file_path, target_dir) # Tắt tự động xử lý
-            
-            return {
-                "message": "Video uploaded successfully and saved to unique folder",
-                "folder": unique_folder,
-                "filename": file.filename
-            }
 
         # --- WebSocket Handler ---
         async def handler(websocket):
@@ -314,19 +290,13 @@ class GUI:
                 print(f"[WS] Client disconnected. Total: {len(self.clients)}")
 
         async def main():
-            # Chạy song song cả WebSocket Server và FastAPI Server
+            # Chạy WebSocket Server
             ws_server = websockets.serve(handler, "0.0.0.0", ws_port)
             
-            # Cấu hình uvicorn chạy trong cùng loop
-            config = uvicorn.Config(app, host="0.0.0.0", port=http_port, log_level="error")
-            http_server = uvicorn.Server(config)
-
             print(f"[SERVER] WebSocket chạy tại cổng {ws_port}")
-            print(f"[SERVER] HTTP Upload chạy tại cổng {http_port}")
 
             await asyncio.gather(
                 ws_server,
-                http_server.serve(),
                 self._ws_broadcast_task()
             )
 
@@ -336,36 +306,6 @@ class GUI:
             print(f"[SERVER] Error: {e}")
         finally:
             self.loop.close()
-
-    def _process_uploaded_video(self, video_path, target_dir):
-        """Hàm xử lý video chạy ngầm: COLMAP -> Train"""
-        print(f"[PROCESS] Đang xử lý COLMAP trong thư mục: {target_dir}")
-        try:
-            # 1. Chạy colmap2nerf (Kết quả ảnh sẽ nằm trong target_dir/images)
-            subprocess.run([
-                "python", "scripts/colmap2nerf.py", 
-                "--video", video_path, 
-                "--run_colmap", 
-                "--video_fps", "2"
-            ], check=True)
-            
-            # 2. Tự động bắt đầu training
-            # Script colmap2nerf sẽ tạo thư mục images cùng cấp với video
-            data_path = target_dir 
-            print(f"[PROCESS] COLMAP xong. Bắt đầu training dữ liệu tại: {data_path}")
-            
-            subprocess.run([
-                "python", "train.py", 
-                "--path", data_path, 
-                "--workspace", self.workspace, 
-                "--epochs", "50", 
-                "--fp16"
-            ], check=True)
-            
-            print(f"[PROCESS] Hoàn tất! Dữ liệu đã được tích hợp vào {self.workspace}")
-            self.need_update = True
-        except Exception as e:
-            print(f"[PROCESS] Lỗi khi xử lý: {e}")
 
     async def _ws_broadcast_task(self):
         while self.running:
@@ -408,13 +348,15 @@ class GUI:
                         self.elevation = np.clip(self.elevation, -89.0, 89.0)
                         dpg.set_value("_azimuth_slider", self.azimuth)
                         dpg.set_value("_elevation_slider", self.elevation)
+                        dpg.set_value("_elevation_slider", self.elevation)
                         self.is_moving = True
+                        self.last_move_time = time.time()
                         self.need_update = True
                 mouse_last_pos = mouse_pos
                 mouse_was_down = True
             else:
-                if mouse_was_down:
-                    # Mouse released, trigger high quality render
+                # If not dragging, check if we should stop moving (for zoom or after release)
+                if self.is_moving and time.time() - self.last_move_time > 0.1:
                     self.is_moving = False
                     self.need_update = True
                 mouse_was_down = False
@@ -445,19 +387,40 @@ class GUI:
                 fl = self.W  # Default FOV if unspecified
                 intrinsics = self.intrinsics if self.intrinsics is not None else np.array([fl, fl, self.W / 2, self.H / 2])
                 
-                # Dynamic rendering quality
-                current_steps = 16 if self.is_moving else self.num_steps
-                current_upsample = 0 if self.is_moving else self.upsample_steps
+                # Dynamic rendering quality & Resolution
+                if self.is_moving:
+                    render_H, render_W = 100, 100
+                    current_steps = 16
+                    current_upsample = 0
+                else:
+                    render_H, render_W = self.H, self.W
+                    current_steps = self.num_steps
+                    current_upsample = self.upsample_steps
+                
+                # Scale intrinsics based on current render resolution
+                s_H = render_H / self.H
+                s_W = render_W / self.W
+                curr_intrinsics = intrinsics.copy()
+                curr_intrinsics[0] *= s_W # fl_x
+                curr_intrinsics[1] *= s_H # fl_y
+                curr_intrinsics[2] *= s_W # cx
+                curr_intrinsics[3] *= s_H # cy
                 
                 # Render using float32 directly
                 with torch.no_grad():
                     image_float = render_full_image(
-                        self.model, pose, intrinsics, self.H, self.W, 
+                        self.model, pose, curr_intrinsics, render_H, render_W, 
                         bg_color=self.bg_color,
                         return_float=True,
                         num_steps=current_steps, 
-                        upsample_steps=current_upsample
+                        upsample_steps=current_upsample,
+                        T_thresh=self.t_thresh,
+                        dt_gamma=self.dt_gamma
                     )
+                
+                # Upscale if rendering at lower resolution
+                if render_H != self.H or render_W != self.W:
+                    image_float = cv2.resize(image_float, (self.W, self.H), interpolation=cv2.INTER_LINEAR)
                     
                 # Update texture without creating new numpy array
                 self.image[..., :3] = image_float
@@ -470,30 +433,46 @@ class GUI:
                 # Signal main thread to update UI
                 self.new_image_ready = True
 
-                # Signal WebSocket to broadcast (Encode if clients connected OR if no packet exists yet)
-                if (self.clients or self.last_packet is None) and not self.ws_queue.full():
-                    try:
-                        # Encode to JPEG
-                        img_uint8 = (self.image[..., :3] * 255).astype(np.uint8)
-                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-                        _, buffer = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-                        
-                        # Add metadata
-                        packet = json.dumps({
-                            "type": "image",
-                            "signature": "InstantNGP",
-                            "image": jpg_as_text,
-                            "fps": self.current_fps,
-                            "res": f"{self.W}x{self.H}"
-                        })
-                        self.last_packet = packet
-                        if self.clients:
-                            self.ws_queue.put_nowait(packet)
-                    except queue.Full:
-                        pass
+                # Offload JPEG encoding to background thread to not block rendering
+                if (self.clients or self.last_packet is None) and not self.encode_queue.full():
+                    # Copy image data to avoid race conditions
+                    img_to_encode = self.image[..., :3].copy()
+                    self.encode_queue.put_nowait((img_to_encode, self.current_fps))
             else:
-                time.sleep(0.005)
+                time.sleep(0.001) # Reduced sleep for faster response
+
+    def _encoder_worker(self):
+        """Background thread to handle JPEG encoding and WebSocket preparation"""
+        while self.running:
+            try:
+                # Wait for new image to encode
+                img_float, fps = self.encode_queue.get(timeout=1.0)
+                
+                # Encode to JPEG
+                img_uint8 = (img_float * 255).astype(np.uint8)
+                img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+                _, buffer = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+                
+                # Add metadata
+                packet = json.dumps({
+                    "type": "image",
+                    "signature": "InstantNGP",
+                    "image": jpg_as_text,
+                    "fps": fps,
+                    "res": f"{self.W}x{self.H}"
+                })
+                self.last_packet = packet
+                
+                # Push to broadcast queue
+                if self.clients and not self.ws_queue.full():
+                    self.ws_queue.put_nowait(packet)
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                # print(f"[Encoder] Error: {e}")
+                pass
 
 if __name__ == "__main__":
     import argparse
@@ -504,12 +483,10 @@ if __name__ == "__main__":
     parser.add_argument('--display', type=int, default=None, help="Display resolution (upscale)")
     parser.add_argument('--angle', type=float, default=None, help="Camera angle x (FOV) override")
     parser.add_argument('--port_ws', type=int, default=8000)
-    parser.add_argument('--port_http', type=int, default=8081)
     args = parser.parse_args()
     
     # Pass ports to GUI
     GUI.port_ws = args.port_ws
-    GUI.port_http = args.port_http
 
     gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, camera_angle_x=args.angle, display_res=args.display)
     gui.render_loop()

@@ -63,8 +63,13 @@ def test(args):
     # 1. Load Dataset
     # -------------------------------------------------------------------------
     print(f"Loading test dataset from {path}...")
-    test_dataset = NeRFDataset(path, type='test', device=device)
-    print(f"Loaded {len(test_dataset.poses)} test frames.")
+    test_dataset = NeRFDataset(path, type='test', device=device, downscale=args.downscale)
+    
+    # Print dataset memory usage
+    mem_images = test_dataset.images.element_size() * test_dataset.images.nelement()
+    mem_poses = test_dataset.poses.element_size() * test_dataset.poses.nelement()
+    total_mem = (mem_images + mem_poses) / (1024 * 1024) # MB
+    print(f"Loaded {len(test_dataset.poses)} test frames. Dataset memory usage: {total_mem:.2f} MB")
 
     # -------------------------------------------------------------------------
     # 2. Initialize Model
@@ -175,12 +180,13 @@ if __name__ == "__main__":
     parser.add_argument('--path', type=str, default='./data', help="Path to data")
     parser.add_argument('--workspace', type=str, default='workspace', help="Workspace directory")
     parser.add_argument('--seed', type=int, default=42, help="Random seed")
-    parser.add_argument('--bound', type=float, default=2.0, help="Scene bound")
+    parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
     parser.add_argument('--max_steps', type=int, default=1024, help="Max steps per ray")
     parser.add_argument('--ckpt', type=str, default=None, help="Specific checkpoint path to load")
     parser.add_argument('--use_ema', action='store_true', help="Use EMA weights if available")
     parser.add_argument('--save_video', action='store_true', help="Save test images as video")
     parser.add_argument('--fps', type=int, default=30, help="FPS for video")
+    parser.add_argument('--downscale', type=int, default=1, help="Downscale images before loading")
     parser.add_argument('--ignore_transparent', action='store_true', help="Ignore transparent pixels in GT for PSNR")
 
     args = parser.parse_args()

@@ -70,9 +70,14 @@ def train(args):
     # 1. Load Dataset
     # -------------------------------------------------------------------------
     print(f"Loading dataset from {path}...")
-    train_dataset = NeRFDataset(path, type='train', device=device, num_rays=args.num_rays)
+    train_dataset = NeRFDataset(path, type='train', device=device, num_rays=args.num_rays, downscale=args.downscale)
     train_loader = train_dataset.dataloader()
-    print(f"Loaded {len(train_dataset.poses)} frames.")
+    
+    # Print dataset memory usage
+    mem_images = train_dataset.images.element_size() * train_dataset.images.nelement()
+    mem_poses = train_dataset.poses.element_size() * train_dataset.poses.nelement()
+    total_mem = (mem_images + mem_poses) / (1024 * 1024) # MB
+    print(f"Loaded {len(train_dataset.poses)} frames. Dataset memory usage: {total_mem:.2f} MB")
 
     # -------------------------------------------------------------------------
     # 2. Initialize Model
@@ -314,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument('--fp16', action='store_true', help="Use AMP (fp16) for faster training")
     parser.add_argument('--ema_decay', type=float, default=0.95, help="EMA decay rate (0 = disable)")
     parser.add_argument('--save_interval', type=int, default=20, help="Save checkpoint every N epochs")
+    parser.add_argument('--downscale', type=int, default=1, help="Downscale images before loading")
     parser.add_argument('--update_extra_interval', type=int, default=16,
                         help="Update density grid every N steps (cuda_ray)")
 

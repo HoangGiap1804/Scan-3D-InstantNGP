@@ -81,7 +81,8 @@ class NeRFDataset:
             if image.shape[0] != self.H or image.shape[1] != self.W:
                 image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
                 
-            image = image.astype(np.float32) / 255 # [H, W, 3/4]
+            # image = image.astype(np.float32) / 255 # [H, W, 3/4]
+            image = image.astype(np.uint8) # [H, W, 3/4]
 
             self.poses.append(pose)
             self.images.append(image)
@@ -121,7 +122,7 @@ class NeRFDataset:
         }
 
         if self.images is not None:
-            images = self.images[index:index+1].to(self.device) # [B, H, W, 3/4]
+            images = self.images[index:index+1].to(self.device).float() / 255 # [B, H, W, 3/4]
             if self.training:
                 C = images.shape[-1]
                 # Sample pixels if training

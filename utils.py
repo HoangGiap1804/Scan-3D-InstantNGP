@@ -1,6 +1,7 @@
 import torch
 import cv2
 import numpy as np
+import os
 from packaging import version as pver
 
 def custom_meshgrid(*args):
@@ -153,20 +154,52 @@ def save_video(images, path, fps=10):
     if len(images) == 0:
         return
     
-    # Force .avi extension for better compatibility with XVID
-    if not path.endswith('.avi'):
-        path = os.path.splitext(path)[0] + '.avi'
-    
     H, W, _ = images[0].shape
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(path, fourcc, fps, (W, H))
+    
+    if path.endswith('.mp4'):
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        out = cv2.VideoWriter(path, fourcc, fps, (W, H))
+        if not out.isOpened():
+            print(f"[Warning] 'avc1' codec failed, falling back to 'mp4v'...")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(path, fourcc, fps, (W, H))
+    else:
+        if not path.endswith('.avi'):
+            path = os.path.splitext(path)[0] + '.avi'
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(path, fourcc, fps, (W, H))
+        
+    if not out.isOpened():
+        print(f"[Error] Failed to open VideoWriter with path: {path}")
+        return
     
     for img in images:
         # OpenCV uses BGR, so we need to convert from RGB
         out.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         
     out.release()
-    print(f"Video saved to {path}")
+
+    # Convert to H.264 using ffmpeg for better compatibility with IDEs/Browsers
+    if path.endswith('.mp4'):
+        import subprocess
+        temp_path = path.replace('.mp4', '_temp.mp4')
+        if os.path.exists(path):
+            os.rename(path, temp_path)
+            try:
+                # Use ffmpeg to encode to H.264 (yuv420p is required for many players)
+                subprocess.run([
+                    'ffmpeg', '-y', '-i', temp_path, 
+                    '-vcodec', 'libx264', '-pix_fmt', 'yuv420p', 
+                    path
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.remove(temp_path)
+                print(f"Video saved and converted to H.264: {path}")
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    os.rename(temp_path, path)
+                print(f"Video saved to {path} (H.264 conversion failed, use VLC)")
+    else:
+        print(f"Video saved successfully to {path}")
 def get_orbit_pose(azimuth, elevation, radius, center=np.array([0, 0, 0], dtype=np.float32)):
     ''' get a camera pose for orbit viewing
     Args:
