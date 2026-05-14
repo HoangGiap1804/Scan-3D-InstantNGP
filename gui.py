@@ -17,12 +17,15 @@ from model import NeRFNetwork
 from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
 
 class GUI:
-    def __init__(self, workspace, ckpt_path=None, H=800, W=800, camera_angle_x=None, display_res=None):
+    def __init__(self, workspace, ckpt_path=None, H=800, W=800, camera_angle_x=None, display_res=None, bound=0.5, bg_radius=-1, **kwargs):
         self.workspace = workspace
         self.H = H
         self.W = W
         self.display_W = display_res if display_res else W
         self.display_H = display_res if display_res else H
+        self.bound = bound
+        self.bg_radius = bg_radius
+        self.color_space = kwargs.get('color_space', 'srgb')
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Camera parameters
@@ -78,7 +81,7 @@ class GUI:
         
     def load_model(self, ckpt_path=None):
         print(f"Initializing model...")
-        self.model = NeRFNetwork(bound=0.5, cuda_ray=True).to(self.device).eval()
+        self.model = NeRFNetwork(bound=self.bound, bg_radius=self.bg_radius, cuda_ray=True).to(self.device).eval()
         
         if ckpt_path is None:
             # Ưu tiên tìm model.pth
@@ -100,9 +103,9 @@ class GUI:
             print(f"Loading checkpoint from {ckpt_path}...")
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                self.model.load_state_dict(checkpoint['model'])
+                self.model.load_state_dict(checkpoint['model'], strict=False)
             else:
-                self.model.load_state_dict(checkpoint)
+                self.model.load_state_dict(checkpoint, strict=False)
         else:
             print("No checkpoint found, using uninitialized model.")
 
@@ -129,7 +132,13 @@ class GUI:
                         transform = json.load(f)
                     if 'camera_angle_x' in transform:
                         fl_x = self.W / (2 * np.tan(transform['camera_angle_x'] / 2))
-                        fl_y = fl_x
+                        if 'camera_angle_y' in transform:
+                            fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2))
+                        else:
+                            fl_y = fl_x
+                    elif 'camera_angle_y' in transform:
+                        fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2))
+                        fl_x = fl_y
                     elif 'fl_x' in transform:
                         scale = self.W / transform['w'] if 'w' in transform else 1.0
                         fl_x = transform['fl_x'] * scale
@@ -389,7 +398,7 @@ class GUI:
                 
                 # Dynamic rendering quality & Resolution
                 if self.is_moving:
-                    render_H, render_W = 100, 100
+                    render_H, render_W = 150, 150
                     current_steps = 16
                     current_upsample = 0
                 else:
@@ -415,7 +424,8 @@ class GUI:
                         num_steps=current_steps, 
                         upsample_steps=current_upsample,
                         T_thresh=self.t_thresh,
-                        dt_gamma=self.dt_gamma
+                        dt_gamma=self.dt_gamma,
+                        color_space=self.color_space
                     )
                 
                 # Upscale if rendering at lower resolution
@@ -482,11 +492,14 @@ if __name__ == "__main__":
     parser.add_argument('--res', type=int, default=400, help="Render resolution")
     parser.add_argument('--display', type=int, default=None, help="Display resolution (upscale)")
     parser.add_argument('--angle', type=float, default=None, help="Camera angle x (FOV) override")
+    parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="If positive, use a background model at sphere(bg_radius)")
+    parser.add_argument('--color_space', type=str, default='srgb', choices=['srgb', 'linear'], help="Color space used during training")
     parser.add_argument('--port_ws', type=int, default=8000)
     args = parser.parse_args()
     
     # Pass ports to GUI
     GUI.port_ws = args.port_ws
 
-    gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, camera_angle_x=args.angle, display_res=args.display)
+    gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, camera_angle_x=args.angle, display_res=args.display, bound=args.bound, bg_radius=args.bg_radius, color_space=args.color_space)
     gui.render_loop()

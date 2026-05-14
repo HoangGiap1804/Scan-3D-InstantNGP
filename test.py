@@ -75,7 +75,7 @@ def test(args):
     # 2. Initialize Model
     # -------------------------------------------------------------------------
     print(f"Initializing model with bound {args.bound}...")
-    model = NeRFNetwork(bound=args.bound, cuda_ray=True).to(device)
+    model = NeRFNetwork(bound=args.bound, bg_radius=args.bg_radius, cuda_ray=True).to(device)
 
     # -------------------------------------------------------------------------
     # 3. Load Checkpoint
@@ -102,12 +102,12 @@ def test(args):
             # Check if we should use EMA
             if args.use_ema and 'ema' in checkpoint:
                 print("Using EMA weights...")
-                model.load_state_dict(checkpoint['ema'])
+                model.load_state_dict(checkpoint['ema'], strict=False)
             else:
-                model.load_state_dict(checkpoint['model'])
+                model.load_state_dict(checkpoint['model'], strict=False)
         else:
             # Old format: just state_dict
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(checkpoint, strict=False)
     else:
         print(f"Error: No checkpoint found at {ckpt_path}")
         return
@@ -181,6 +181,7 @@ if __name__ == "__main__":
     parser.add_argument('--workspace', type=str, default='workspace', help="Workspace directory")
     parser.add_argument('--seed', type=int, default=42, help="Random seed")
     parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="If positive, use a background model at sphere(bg_radius)")
     parser.add_argument('--max_steps', type=int, default=1024, help="Max steps per ray")
     parser.add_argument('--ckpt', type=str, default=None, help="Specific checkpoint path to load")
     parser.add_argument('--use_ema', action='store_true', help="Use EMA weights if available")

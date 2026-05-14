@@ -50,23 +50,20 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
 
             # random sample left-top cores.
             num_patch = N // (patch_size ** 2)
-            inds_x = torch.randint(0, H - patch_size, size=[num_patch], device=device)
-            inds_y = torch.randint(0, W - patch_size, size=[num_patch], device=device)
-            inds = torch.stack([inds_x, inds_y], dim=-1) # [np, 2]
+            inds_x = torch.randint(0, H - patch_size, size=[B, num_patch], device=device)
+            inds_y = torch.randint(0, W - patch_size, size=[B, num_patch], device=device)
+            inds = torch.stack([inds_x, inds_y], dim=-1) # [B, np, 2]
 
             # create meshgrid for each patch
             pi, pj = custom_meshgrid(torch.arange(patch_size, device=device), torch.arange(patch_size, device=device))
             offsets = torch.stack([pi.reshape(-1), pj.reshape(-1)], dim=-1) # [p^2, 2]
 
-            inds = inds.unsqueeze(1) + offsets.unsqueeze(0) # [np, p^2, 2]
-            inds = inds.view(-1, 2) # [N, 2]
-            inds = inds[:, 0] * W + inds[:, 1] # [N], flatten
-
-            inds = inds.expand([B, N])
+            inds = inds.unsqueeze(2) + offsets.unsqueeze(0).unsqueeze(0) # [B, np, p^2, 2]
+            inds = inds.view(B, -1, 2) # [B, N, 2]
+            inds = inds[:, :, 0] * W + inds[:, :, 1] # [B, N], flatten
 
         elif error_map is None:
-            inds = torch.randint(0, H*W, size=[N], device=device) # may duplicate
-            inds = inds.expand([B, N])
+            inds = torch.randint(0, H*W, size=[B, N], device=device) # independent per image
         else:
 
             # weighted sample on a low-reso grid
@@ -115,7 +112,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
 
 @torch.no_grad()
-def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=False, **kwargs):
+def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=False, color_space='srgb', **kwargs):
     ''' render a full image from a pose
     Args:
         model: NeRFRenderer
@@ -124,6 +121,7 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=
         H, W: int
         bg_color: float, list of 3 floats, or torch.Tensor
         return_float: if True, returns float32 numpy array [0, 1], else uint8.
+        color_space: 'srgb' or 'linear'
         **kwargs: additional arguments for model.render
     Returns:
         image: [H, W, 3], uint8 or float32
@@ -138,10 +136,13 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=
         outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
         image = outputs['image'].reshape(H, W, 3)
         
+    if color_space == 'linear':
+        image = linear_to_srgb(image)
+
     if return_float:
         return image.cpu().numpy()
     
-    return (image.cpu().numpy() * 255).astype(np.uint8)
+    return (image.cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
 
 
 def save_video(images, path, fps=10):

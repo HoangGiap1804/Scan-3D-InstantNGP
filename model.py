@@ -80,6 +80,35 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
+        # background network
+        if self.bg_radius > 0:
+            self.num_layers_bg = 2
+            self.hidden_dim_bg = 64
+            self.encoder_bg = tcnn.Encoding(
+                n_input_dims=2,
+                encoding_config={
+                    "otype": "HashGrid",
+                    "n_levels": 4,
+                    "n_features_per_level": 2,
+                    "log2_hashmap_size": 19,
+                    "base_resolution": 16,
+                    "per_level_scale": np.exp2(np.log2(2048 / 16) / (4 - 1)),
+                },
+            )
+            self.bg_net = tcnn.Network(
+                n_input_dims=self.encoder_dir.n_output_dims + self.encoder_bg.n_output_dims,
+                n_output_dims=3,
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": self.hidden_dim_bg,
+                    "n_hidden_layers": self.num_layers_bg - 1,
+                },
+            )
+        else:
+            self.bg_net = None
+
     
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -122,6 +151,23 @@ class NeRFNetwork(NeRFRenderer):
             'sigma': sigma,
             'geo_feat': geo_feat,
         }
+
+    def background(self, x, d):
+        # x: [N, 2], in [-1, 1]
+
+        x = (x + 1) / 2 # to [0, 1]
+        h = self.encoder_bg(x)
+
+        d = (d + 1) / 2 # to [0, 1]
+        d = self.encoder_dir(d)
+
+        h = torch.cat([d, h], dim=-1)
+        h = self.bg_net(h)
+        
+        # sigmoid activation for rgb
+        rgbs = torch.sigmoid(h)
+
+        return rgbs
 
     # allow masked inference
     def color(self, x, d, mask=None, geo_feat=None, **kwargs):
