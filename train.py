@@ -83,7 +83,7 @@ def train(args):
     # 2. Initialize Model
     # -------------------------------------------------------------------------
     print(f"Initializing model with bound {args.bound}...")
-    model = NeRFNetwork(bound=args.bound, cuda_ray=True).to(device)
+    model = NeRFNetwork(bound=args.bound, cuda_ray=True, bg_radius=args.bg_radius).to(device)
     print(model)
 
     # EMA wrapper (decay=0.95 giống torch-ngp)
@@ -277,10 +277,19 @@ def train(args):
             val_images_epoch = []
             with torch.no_grad():
                 with torch.amp.autocast('cuda', enabled=args.fp16):
+                    # Scale intrinsics to match validation resolution
+                    s_H = args.val_res / val_H
+                    s_W = args.val_res / val_W
+                    curr_intrinsics = val_intrinsics.copy()
+                    curr_intrinsics[0] *= s_W
+                    curr_intrinsics[1] *= s_H
+                    curr_intrinsics[2] *= s_W
+                    curr_intrinsics[3] *= s_H
+
                     for vi, vpose in enumerate(val_poses):
                         img = render_full_image(
                             model, vpose.unsqueeze(0),
-                            val_intrinsics, val_H, val_W,
+                            curr_intrinsics, args.val_res, args.val_res,
                             bg_color=0.0, max_steps=args.max_steps,
                         )
                         val_images_epoch.append(img)
@@ -322,6 +331,8 @@ if __name__ == "__main__":
     parser.add_argument('--downscale', type=int, default=1, help="Downscale images before loading")
     parser.add_argument('--update_extra_interval', type=int, default=16,
                         help="Update density grid every N steps (cuda_ray)")
+    parser.add_argument('--val_res', type=int, default=800, help="Validation render resolution")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
 
     args = parser.parse_args()
     train(args)

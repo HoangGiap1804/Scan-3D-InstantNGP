@@ -75,7 +75,7 @@ def test(args):
     # 2. Initialize Model
     # -------------------------------------------------------------------------
     print(f"Initializing model with bound {args.bound}...")
-    model = NeRFNetwork(bound=args.bound, cuda_ray=True).to(device)
+    model = NeRFNetwork(bound=args.bound, cuda_ray=True, bg_radius=args.bg_radius).to(device)
 
     # -------------------------------------------------------------------------
     # 3. Load Checkpoint
@@ -134,10 +134,24 @@ def test(args):
             if args.ignore_transparent and gt_image.shape[-1] == 4:
                 mask = gt_image[..., 3] > 0
             
+            # Handle custom resolution and intrinsic scaling
+            render_H, render_W = test_dataset.H, test_dataset.W
+            curr_intrinsics = test_dataset.intrinsics
+            
+            if args.res is not None:
+                render_H, render_W = args.res, args.res
+                s_H = render_H / test_dataset.H
+                s_W = render_W / test_dataset.W
+                curr_intrinsics = curr_intrinsics.copy()
+                curr_intrinsics[0] *= s_W
+                curr_intrinsics[1] *= s_H
+                curr_intrinsics[2] *= s_W
+                curr_intrinsics[3] *= s_H
+
             # Render image (returns float [H, W, 3])
             pred_image_float = render_full_image(
-                model, pose, test_dataset.intrinsics,
-                test_dataset.H, test_dataset.W,
+                model, pose, curr_intrinsics,
+                render_H, render_W,
                 bg_color=0.0, max_steps=args.max_steps,
                 return_float=True
             )
@@ -187,7 +201,9 @@ if __name__ == "__main__":
     parser.add_argument('--save_video', action='store_true', help="Save test images as video")
     parser.add_argument('--fps', type=int, default=30, help="FPS for video")
     parser.add_argument('--downscale', type=int, default=1, help="Downscale images before loading")
+    parser.add_argument('--res', type=int, default=None, help="Render resolution (defaults to dataset resolution)")
     parser.add_argument('--ignore_transparent', action='store_true', help="Ignore transparent pixels in GT for PSNR")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
 
     args = parser.parse_args()
     test(args)

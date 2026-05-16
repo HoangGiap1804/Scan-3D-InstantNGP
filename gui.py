@@ -17,8 +17,10 @@ from model import NeRFNetwork
 from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
 
 class GUI:
-    def __init__(self, workspace, ckpt_path=None, H=800, W=800, camera_angle_x=None, display_res=None):
+    def __init__(self, workspace, ckpt_path=None, H=800, W=800, bound=0.5, camera_angle_x=None, display_res=None, bg_radius=-1):
         self.workspace = workspace
+        self.bound = bound
+        self.bg_radius = bg_radius
         self.H = H
         self.W = W
         self.display_W = display_res if display_res else W
@@ -77,8 +79,8 @@ class GUI:
         self.setup_dpg()
         
     def load_model(self, ckpt_path=None):
-        print(f"Initializing model...")
-        self.model = NeRFNetwork(bound=0.5, cuda_ray=True).to(self.device).eval()
+        print(f"Initializing model with bound {self.bound}...")
+        self.model = NeRFNetwork(bound=self.bound, cuda_ray=True, bg_radius=self.bg_radius).to(self.device).eval()
         
         if ckpt_path is None:
             # Ưu tiên tìm model.pth
@@ -479,14 +481,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--ckpt', type=str, default=None)
-    parser.add_argument('--res', type=int, default=400, help="Render resolution")
+    parser.add_argument('--res', type=int, default=800, help="Render resolution")
+    parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
     parser.add_argument('--display', type=int, default=None, help="Display resolution (upscale)")
     parser.add_argument('--angle', type=float, default=None, help="Camera angle x (FOV) override")
     parser.add_argument('--port_ws', type=int, default=8000)
+    parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
     args = parser.parse_args()
     
     # Pass ports to GUI
     GUI.port_ws = args.port_ws
 
-    gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, camera_angle_x=args.angle, display_res=args.display)
+    gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, bound=args.bound, camera_angle_x=args.angle, display_res=args.display, bg_radius=args.bg_radius)
     gui.render_loop()

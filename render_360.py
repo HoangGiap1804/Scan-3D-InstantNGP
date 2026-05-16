@@ -13,7 +13,7 @@ def render_360(args):
 
     # 1. Initialize Model
     print(f"Initializing model with bound {args.bound}...")
-    model = NeRFNetwork(bound=args.bound, cuda_ray=True).to(device).eval()
+    model = NeRFNetwork(bound=args.bound, cuda_ray=True, bg_radius=args.bg_radius).to(device).eval()
 
     # 2. Load Checkpoint
     ckpt_path = args.ckpt
@@ -116,6 +116,7 @@ if __name__ == "__main__":
     parser.add_argument('--bound', type=float, default=0.5, help="Scene bound")
     parser.add_argument('--num_steps', type=int, default=128, help="Number of steps per ray")
     parser.add_argument('--upsample_steps', type=int, default=128, help="Number of upsample steps per ray")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
 
     args = parser.parse_args()
     render_360(args)
