@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import raymarching
-from utils import custom_meshgrid
+from utils import custom_meshgrid, RenderingInterrupted
 import grid
 
 class NeRFRenderer(nn.Module):
@@ -186,17 +186,22 @@ class NeRFRenderer(nn.Module):
 
         _run = self.run_cuda
 
+        # Extract check_interrupt if present
+        check_interrupt = kwargs.pop('check_interrupt', None)
+
         B, N = rays_o.shape[:2]
         device = rays_o.device
 
-        # never stage when cuda_ray
-        if staged and not self.cuda_ray:
+        # If staged is True, stage the rendering. We now support staging even with cuda_ray
+        if staged:
             depth = torch.empty((B, N), device=device)
             image = torch.empty((B, N, 3), device=device)
 
             for b in range(B):
                 head = 0
                 while head < N:
+                    if check_interrupt is not None and check_interrupt():
+                        raise RenderingInterrupted("Rendering interrupted by user request")
                     tail = min(head + max_ray_batch, N)
                     results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
                     depth[b:b+1, head:tail] = results_['depth']

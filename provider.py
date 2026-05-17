@@ -19,7 +19,7 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     return new_pose
 
 class NeRFDataset:
-    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10, num_rays=4096):
+    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10, num_rays=4096, use_error_map=False, patch_size=1, color_space='srgb'):
         super().__init__()
         
         self.root_path = path
@@ -33,8 +33,11 @@ class NeRFDataset:
         self.offset = [0, 0, 0]
         self.bound = 2
         self.fp16 = True
-        self.color_space = 'srgb'
+        self.color_space = color_space
         self.num_rays = num_rays if self.training else -1
+
+        self.use_error_map = use_error_map
+        self.patch_size = patch_size
 
         # Load transforms.json
         json_path = os.path.join(self.root_path, f'transforms_{type}.json')
@@ -78,6 +81,14 @@ class NeRFDataset:
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
+            # Color space conversion: sRGB -> Linear
+            if self.color_space == 'linear':
+                # Simplified conversion, assuming input is 8-bit sRGB
+                # Only apply to RGB channels
+                image_rgb = image[..., :3].astype(np.float32) / 255.0
+                image_rgb = image_rgb ** 2.2
+                image[..., :3] = (image_rgb * 255.0).astype(np.uint8)
+
             if image.shape[0] != self.H or image.shape[1] != self.W:
                 image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
                 
@@ -90,6 +101,11 @@ class NeRFDataset:
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         
+        if self.training and self.use_error_map:
+            self.error_map = torch.ones([self.images.shape[0], 128 * 128], dtype=torch.float) # [N, 128*128]
+        else:
+            self.error_map = None
+
         # Load intrinsics
         if 'camera_angle_x' in transform:
             fl_x = self.W / (2 * np.tan(transform['camera_angle_x'] / 2))
@@ -110,16 +126,24 @@ class NeRFDataset:
 
         index = index[0]
         poses = self.poses[index:index+1].to(self.device) # [B, 4, 4]
+
+        error_map = None
+        if self.training and self.error_map is not None:
+            error_map = self.error_map[index:index+1] # [B, 128*128]
         
-        # Patch size is usually 1 unless specified for LPIPS
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map=None, patch_size=1)
+        # Patch size support
+        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map=error_map, patch_size=self.patch_size)
 
         results = {
             'H': self.H,
             'W': self.W,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
+            'index': index,
         }
+
+        if 'inds_coarse' in rays:
+            results['inds_coarse'] = rays['inds_coarse']
 
         if self.images is not None:
             images = self.images[index:index+1].to(self.device).float() / 255 # [B, H, W, 3/4]

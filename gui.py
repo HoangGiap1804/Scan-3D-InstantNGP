@@ -14,13 +14,15 @@ import socket
 import qrcode
 
 from model import NeRFNetwork
-from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb
+from utils import seed_everything, render_full_image, get_orbit_pose, linear_to_srgb, RenderingInterrupted
 
 class GUI:
     def __init__(self, workspace, ckpt_path=None, H=800, W=800, bound=0.5, camera_angle_x=None, display_res=None, bg_radius=-1):
         self.workspace = workspace
         self.bound = bound
         self.bg_radius = bg_radius
+        self.bg_radius_orig = bg_radius
+        self.enable_bg = bg_radius > 0
         self.H = H
         self.W = W
         self.display_W = display_res if display_res else W
@@ -41,6 +43,7 @@ class GUI:
         self.upsample_steps = 128
         self.t_thresh = 0.001 # Ngưỡng dừng tia (Tăng để nhanh hơn)
         self.dt_gamma = 0     # Bước nhảy thích ứng
+        self.color_space = 'srgb' # Không gian màu hiển thị
         self.model = None
         self.image = np.zeros((H, W, 4), dtype=np.float32)
         self.image[..., 3] = 1.0 # Set opaque alpha once
@@ -78,6 +81,10 @@ class GUI:
         dpg.create_context()
         self.setup_dpg()
         
+    def check_interrupt(self):
+        """Returns True if the camera has moved or settings changed, requiring a new render."""
+        return self.need_update
+
     def load_model(self, ckpt_path=None):
         print(f"Initializing model with bound {self.bound}...")
         self.model = NeRFNetwork(bound=self.bound, cuda_ray=True, bg_radius=self.bg_radius).to(self.device).eval()
@@ -176,10 +183,15 @@ class GUI:
             dpg.add_separator()
             dpg.add_text("Rendering Options")
             dpg.add_slider_float(label="Background Color", min_value=0.0, max_value=1.0, default_value=self.bg_color, callback=self.set_bg_color)
+            if self.bg_radius_orig > 0:
+                dpg.add_checkbox(label="Enable Background Model", default_value=self.enable_bg, callback=self.set_enable_bg)
+            else:
+                dpg.add_checkbox(label="Enable Background Model", default_value=False, enabled=False)
             dpg.add_slider_int(label="Steps", min_value=16, max_value=1024, default_value=self.num_steps, callback=self.set_steps)
             dpg.add_slider_int(label="Upsample Steps", min_value=0, max_value=512, default_value=self.upsample_steps, callback=self.set_upsample_steps)
             dpg.add_slider_float(label="T Thresh", min_value=0.0, max_value=0.1, format="%.4f", default_value=self.t_thresh, callback=self.set_t_thresh)
             dpg.add_slider_float(label="dt Gamma", min_value=0.0, max_value=0.1, format="%.4f", default_value=self.dt_gamma, callback=self.set_dt_gamma)
+            dpg.add_combo(label="Color Space", items=["srgb", "linear"], default_value=self.color_space, callback=self.set_color_space)
             dpg.add_button(label="Force Update", callback=self.force_update)
             
             dpg.add_separator()
@@ -198,14 +210,64 @@ class GUI:
             dpg.add_mouse_wheel_handler(callback=self.on_mouse_wheel)
 
     # Callbacks
-    def set_azimuth(self, sender, data): self.azimuth = data; self.need_update = True
-    def set_elevation(self, sender, data): self.elevation = data; self.need_update = True
-    def set_radius(self, sender, data): self.radius = data; self.need_update = True
-    def set_bg_color(self, sender, data): self.bg_color = data; self.need_update = True
-    def set_steps(self, sender, data): self.num_steps = data; self.need_update = True
-    def set_upsample_steps(self, sender, data): self.upsample_steps = data; self.need_update = True
-    def set_t_thresh(self, sender, data): self.t_thresh = data; self.need_update = True
-    def set_dt_gamma(self, sender, data): self.dt_gamma = data; self.need_update = True
+    def set_azimuth(self, sender, data):
+        self.azimuth = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_elevation(self, sender, data):
+        self.elevation = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_radius(self, sender, data):
+        self.radius = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_bg_color(self, sender, data):
+        self.bg_color = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_steps(self, sender, data):
+        self.num_steps = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_upsample_steps(self, sender, data):
+        self.upsample_steps = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_t_thresh(self, sender, data):
+        self.t_thresh = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_dt_gamma(self, sender, data):
+        self.dt_gamma = data
+        self.is_moving = True
+        self.last_move_time = time.time()
+        self.need_update = True
+
+    def set_enable_bg(self, sender, data):
+        self.enable_bg = data
+        if self.model is not None:
+            if self.enable_bg and self.bg_radius_orig > 0:
+                self.model.bg_radius = self.bg_radius_orig
+            else:
+                self.model.bg_radius = -1
+        self.need_update = True
+
+    def set_color_space(self, sender, data): self.color_space = data; self.need_update = True
     def force_update(self, sender, data): self.need_update = True
 
     def on_mouse_wheel(self, sender, app_data):
@@ -272,6 +334,8 @@ class GUI:
                             if "elevation" in data: self.elevation = float(data["elevation"])
                             if "radius" in data: self.radius = float(data["radius"])
                             
+                            self.is_moving = True
+                            self.last_move_time = time.time()
                             self.need_update = True
                             
                             # Đồng bộ ngược lại giao diện DearPyGui (nếu đang mở)
@@ -389,15 +453,22 @@ class GUI:
                 fl = self.W  # Default FOV if unspecified
                 intrinsics = self.intrinsics if self.intrinsics is not None else np.array([fl, fl, self.W / 2, self.H / 2])
                 
+                # Chụp nhanh trạng thái camera để tránh tranh chấp luồng
+                is_moving = self.is_moving
+                
                 # Dynamic rendering quality & Resolution
-                if self.is_moving:
+                if is_moving:
                     render_H, render_W = 100, 100
                     current_steps = 16
                     current_upsample = 0
+                    current_dt_gamma = 0.1
+                    max_ray_batch = 65536
                 else:
                     render_H, render_W = self.H, self.W
-                    current_steps = self.num_steps
+                    current_steps = 16
                     current_upsample = self.upsample_steps
+                    current_dt_gamma = self.dt_gamma
+                    max_ray_batch = 65536
                 
                 # Scale intrinsics based on current render resolution
                 s_H = render_H / self.H
@@ -409,20 +480,29 @@ class GUI:
                 curr_intrinsics[3] *= s_H # cy
                 
                 # Render using float32 directly
-                with torch.no_grad():
-                    image_float = render_full_image(
-                        self.model, pose, curr_intrinsics, render_H, render_W, 
-                        bg_color=self.bg_color,
-                        return_float=True,
-                        num_steps=current_steps, 
-                        upsample_steps=current_upsample,
-                        T_thresh=self.t_thresh,
-                        dt_gamma=self.dt_gamma
-                    )
+                try:
+                    with torch.no_grad():
+                        image_float = render_full_image(
+                            self.model, pose, curr_intrinsics, render_H, render_W, 
+                            bg_color=self.bg_color,
+                            return_float=True,
+                            num_steps=current_steps, 
+                            upsample_steps=current_upsample,
+                            T_thresh=self.t_thresh,
+                            dt_gamma=current_dt_gamma,
+                            max_ray_batch=max_ray_batch,
+                            check_interrupt=self.check_interrupt
+                        )
+                except RenderingInterrupted:
+                    continue
                 
                 # Upscale if rendering at lower resolution
                 if render_H != self.H or render_W != self.W:
                     image_float = cv2.resize(image_float, (self.W, self.H), interpolation=cv2.INTER_LINEAR)
+                    
+                # Color space conversion: Linear -> sRGB
+                if self.color_space == 'linear':
+                    image_float = image_float ** (1 / 2.2)
                     
                 # Update texture without creating new numpy array
                 self.image[..., :3] = image_float
@@ -487,10 +567,12 @@ if __name__ == "__main__":
     parser.add_argument('--angle', type=float, default=None, help="Camera angle x (FOV) override")
     parser.add_argument('--port_ws', type=int, default=8000)
     parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
+    parser.add_argument('--color_space', type=str, default='srgb', choices=['srgb', 'linear'], help="initial color space")
     args = parser.parse_args()
     
     # Pass ports to GUI
     GUI.port_ws = args.port_ws
 
     gui = GUI(args.workspace, args.ckpt, H=args.res, W=args.res, bound=args.bound, camera_angle_x=args.angle, display_res=args.display, bg_radius=args.bg_radius)
+    gui.color_space = args.color_space
     gui.render_loop()
