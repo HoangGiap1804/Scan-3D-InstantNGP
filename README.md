@@ -12,6 +12,8 @@ pip install -r requirements.txt
 Giao diện này tích hợp cả trình xem 3D và Server nhận dữ liệu từ điện thoại.
 ```bash
 python gui.py --res 400 --workspace ./workspace
+
+python gui.py --workspace ./workspaces/workspace_kitchen3/ --res 800 --display 800 --bound 1 --bg_radius 2 --color_space linear
 ```
 *   **Cổng 8000**: WebSocket Viewer (Xem 3D thời gian thực).
 *   **Cổng 8080**: HTTP API (Nhận video upload).
@@ -38,6 +40,11 @@ python scripts/colmap2nerf.py --images ./data/my_folder --run_colmap
 Nếu bạn không dùng tính năng tự động xử lý trên GUI, bạn có thể chạy bằng tay:
 ```bash
 python train.py --path ./data/custom_data --workspace ./workspace --epochs 100 --fp16
+
+# Nâng cao
+python train.py --path videos/vasedeck/ --workspace workspaces/workspace_vasedeck8 --num_rays 1024 --max_steps 562 --bound 4 --bg_radius 8 --fp16 --epochs 1000 --error_map --dt_gamma 0.0078 --min_near 0.1
+
+python train.py --path videos/kitchen/ --workspace workspaces/workspace_kitchen3 --num_rays 1024 --max_steps 562 --bound 1 --bg_radius 2 --fp16 --epochs 1000 --error_map --dt_gamma 0.0078 --min_near 0.1 --color_space linear --density_thresh 0.02
 ```
 
 ## 5. API dành cho Mobile App

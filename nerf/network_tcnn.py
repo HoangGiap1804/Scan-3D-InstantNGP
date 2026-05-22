@@ -6,7 +6,7 @@ import numpy as np
 
 import tinycudann as tcnn
 from activation import trunc_exp
-from renderer import NeRFRenderer
+from .renderer import NeRFRenderer
 
 
 class NeRFNetwork(NeRFRenderer):
@@ -36,7 +36,7 @@ class NeRFNetwork(NeRFRenderer):
                 "otype": "HashGrid",
                 "n_levels": 16,
                 "n_features_per_level": 2,
-                "log2_hashmap_size": 22,
+                "log2_hashmap_size": 19,
                 "base_resolution": 16,
                 "per_level_scale": per_level_scale,
             },
@@ -88,7 +88,7 @@ class NeRFNetwork(NeRFRenderer):
                     "otype": "HashGrid",
                     "n_levels": 8,
                     "n_features_per_level": 2,
-                    "log2_hashmap_size": 22,
+                    "log2_hashmap_size": 19,
                     "base_resolution": 16,
                     "per_level_scale": 2.0,
                 },
@@ -127,6 +127,7 @@ class NeRFNetwork(NeRFRenderer):
         d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
+        #p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
         h = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h)
         

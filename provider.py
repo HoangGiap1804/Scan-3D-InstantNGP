@@ -19,7 +19,7 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     return new_pose
 
 class NeRFDataset:
-    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10, num_rays=4096):
+    def __init__(self, path, type='train', device='cuda', downscale=1, n_test=10, num_rays=4096, use_error_map=False, patch_size=1, color_space='srgb'):
         super().__init__()
         
         self.root_path = path
@@ -33,7 +33,7 @@ class NeRFDataset:
         self.offset = [0, 0, 0]
         self.bound = 2
         self.fp16 = True
-        self.color_space = 'srgb'
+        self.color_space = color_space
         self.num_rays = num_rays if self.training else -1
 
         # Load transforms.json
@@ -77,6 +77,14 @@ class NeRFDataset:
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+
+            # Color space conversion: sRGB -> Linear
+            if self.color_space == 'linear':
+                # Simplified conversion, assuming input is 8-bit sRGB
+                # Only apply to RGB channels
+                image_rgb = image[..., :3].astype(np.float32) / 255.0
+                image_rgb = image_rgb ** 2.2
+                image[..., :3] = (image_rgb * 255.0).astype(np.uint8)
 
             if image.shape[0] != self.H or image.shape[1] != self.W:
                 image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)

@@ -216,6 +216,7 @@ def train(args):
                     bg_color=bg_color,
                     perturb=True,
                     max_steps=args.max_steps,
+                    dt_gamma=args.dt_gamma,
                 )
                 pred_rgb = outputs['image']
                 loss = criterion(pred_rgb, gt_rgb).mean()
@@ -291,7 +292,15 @@ def train(args):
                             model, vpose.unsqueeze(0),
                             curr_intrinsics, args.val_res, args.val_res,
                             bg_color=0.0, max_steps=args.max_steps,
+                            dt_gamma=args.dt_gamma, T_thresh=args.T_thresh,
+                            return_float=True, # Get float32 [0, 1] for gamma correction
                         )
+                        
+                        # Color space conversion: Linear -> sRGB
+                        if args.color_space == 'linear':
+                            img = img ** (1 / 2.2)
+                            
+                        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
                         val_images_epoch.append(img)
                         image_path = os.path.join(val_dir, f'epoch_{epoch:03d}_view{vi:02d}.png')
                         cv2.imwrite(image_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
@@ -333,6 +342,11 @@ if __name__ == "__main__":
                         help="Update density grid every N steps (cuda_ray)")
     parser.add_argument('--val_res', type=int, default=800, help="Validation render resolution")
     parser.add_argument('--bg_radius', type=float, default=-1, help="Radius of background sphere (set >0 to enable background model)")
+    parser.add_argument('--dt_gamma', type=float, default=0, help="dt_gamma for adaptive ray marching. set >0 to accelerate, but usually with worse quality")
+    parser.add_argument('--min_near', type=float, default=0.2, help="minimum near distance for camera")
+    parser.add_argument('--color_space', type=str, default='srgb', choices=['srgb', 'linear'], help="color space for dataset")
+    parser.add_argument('--density_thresh', type=float, default=0.00, help="threshold for density grid to be occupied")
+    parser.add_argument('--T_thresh', type=float, default=1e-4, help="transmittance threshold for early exit")
 
     args = parser.parse_args()
     train(args)

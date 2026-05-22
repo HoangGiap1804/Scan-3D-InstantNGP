@@ -4,6 +4,10 @@ import numpy as np
 import os
 from packaging import version as pver
 
+class RenderingInterrupted(Exception):
+    """Exception raised when rendering is interrupted by user interaction or request."""
+    pass
+
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
     if pver.parse(torch.__version__) < pver.parse('1.10'):
@@ -115,7 +119,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
 
 @torch.no_grad()
-def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=False, **kwargs):
+def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=False, check_interrupt=None, **kwargs):
     ''' render a full image from a pose
     Args:
         model: NeRFRenderer
@@ -124,6 +128,7 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=
         H, W: int
         bg_color: float, list of 3 floats, or torch.Tensor
         return_float: if True, returns float32 numpy array [0, 1], else uint8.
+        check_interrupt: optional callable returning True if rendering should be aborted.
         **kwargs: additional arguments for model.render
     Returns:
         image: [H, W, 3], uint8 or float32
@@ -135,7 +140,7 @@ def render_full_image(model, pose, intrinsics, H, W, bg_color=0.0, return_float=
     
     # staged rendering for full image to avoid OOM
     with torch.cuda.amp.autocast(enabled=True):
-        outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **kwargs)
+        outputs = model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, check_interrupt=check_interrupt, **kwargs)
         image = outputs['image'].reshape(H, W, 3)
         
     if return_float:
