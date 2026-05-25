@@ -25,6 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 
 import trimesh
 import mcubes
+from nerf.occupancy_dual_contouring import occupancy_dual_contouring
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
@@ -607,7 +608,7 @@ class Trainer(object):
         return pred_rgb, pred_depth
 
 
-    def save_mesh(self, save_path=None, resolution=256, threshold=10):
+    def save_mesh(self, save_path=None, resolution=256, threshold=10, do_remesh=False):
 
         if save_path is None:
             save_path = os.path.join(self.workspace, 'meshes', f'{self.name}_{self.epoch}.ply')
@@ -619,13 +620,42 @@ class Trainer(object):
         def query_func(pts):
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    sigma = self.model.density(pts.to(self.device))['sigma']
+                    sigma = self.model.density(pts.to(self.device))['sigma'].reshape(-1)
             return sigma
 
-        vertices, triangles = extract_geometry(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, threshold=threshold, query_func=query_func)
+        dc_extractor = occupancy_dual_contouring(self.device)
+        min_coord = self.model.aabb_infer[:3].tolist()
+        max_coord = self.model.aabb_infer[3:].tolist()
+
+        vertices, triangles = dc_extractor.extract_mesh(
+            imp_func=query_func,
+            min_coord=min_coord,
+            max_coord=max_coord,
+            num_grid=resolution,
+            isolevel=threshold,
+            outside=False,
+            batch_size=1000000
+        )
+
+        vertices = vertices.cpu().numpy()
+        triangles = triangles.cpu().numpy()
 
         mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
         mesh.export(save_path)
+
+        if do_remesh:
+            self.log(f"==> Đang gọi Blender để Voxel Remesh...")
+            import subprocess
+            try:
+                subprocess.run([
+                    "blender", 
+                    "--background", 
+                    "--python", "nerf/voxel_remesh.py", 
+                    "--", save_path, save_path
+                ], check=True)
+                self.log(f"==> Remesh hoàn tất!")
+            except Exception as e:
+                self.log(f"[ERROR] Remesh failed: {e}")
 
         self.log(f"==> Finished saving mesh.")
 

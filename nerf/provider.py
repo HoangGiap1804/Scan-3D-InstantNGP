@@ -15,7 +15,6 @@ from torch.utils.data import DataLoader
 from .utils import get_rays
 
 
-# ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
 def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     # for the fox dataset, 0.33 scales camera radius to ~ 2
     new_pose = np.array([
@@ -197,6 +196,10 @@ class NeRFDataset:
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
 
+                # Tự động tìm đuôi .png nếu đuôi .jpg không tồn tại (Rất hữu ích khi dùng rembg)
+                if not os.path.exists(f_path) and f_path.lower().endswith(('.jpg', '.jpeg')):
+                    f_path = os.path.splitext(f_path)[0] + '.png'
+
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
                     continue
@@ -218,7 +221,8 @@ class NeRFDataset:
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
                     
-                image = image.astype(np.float32) / 255 # [H, W, 3/4]
+                # Store as uint8 to save memory
+                # image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
                 self.poses.append(pose)
                 self.images.append(image)
@@ -246,12 +250,8 @@ class NeRFDataset:
         if self.preload:
             self.poses = self.poses.to(self.device)
             if self.images is not None:
-                # TODO: linear use pow, but pow for half is only available for torch >= 1.10 ?
-                if self.fp16 and self.opt.color_space != 'linear':
-                    dtype = torch.half
-                else:
-                    dtype = torch.float
-                self.images = self.images.to(dtype).to(self.device)
+                # Keep as uint8 to save VRAM
+                self.images = self.images.to(torch.uint8).to(self.device)
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
@@ -313,6 +313,14 @@ class NeRFDataset:
             if self.training:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+                
+            # Convert to float and normalize to [0, 1] for model input
+            if images.dtype == torch.uint8:
+                # If using fp16, we might want to cast to half depending on your needs, but float() is safer for division
+                images = images.float() / 255.0
+                if self.fp16 and self.opt.color_space != 'linear':
+                    images = images.half()
+                    
             results['images'] = images
         
         # need inds to update error_map

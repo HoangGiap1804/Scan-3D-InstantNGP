@@ -256,8 +256,14 @@ class NeRFGUI:
                     with dpg.group(horizontal=True):
                         dpg.add_text("Marching Cubes: ")
 
+                        self.do_remesh = False
+                        def callback_remesh(sender, app_data):
+                            self.do_remesh = app_data
+                            
+                        dpg.add_checkbox(label="remesh", default_value=self.do_remesh, callback=callback_remesh)
+
                         def callback_mesh(sender, app_data):
-                            self.trainer.save_mesh(resolution=256, threshold=10)
+                            self.trainer.save_mesh(resolution=256, threshold=10, do_remesh=self.do_remesh)
                             dpg.set_value("_log_mesh", "saved " + f'{self.trainer.name}_{self.trainer.epoch}.ply')
                             self.trainer.epoch += 1 # use epoch to indicate different calls.
 

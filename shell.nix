@@ -49,6 +49,7 @@ pkgs.mkShell {
     glib
     zlib
     stdenv.cc.cc.lib
+    blender
   ];
 
   shellHook = ''
