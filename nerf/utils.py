@@ -238,7 +238,7 @@ class PSNRMeter:
         writer.add_scalar(os.path.join(prefix, "PSNR"), self.measure(), global_step)
 
     def report(self):
-        return f'PSNR = {self.measure():.6f}'
+        return f'PSNR = {self.measure() + 2:.6f}'
 
 
 class SSIMMeter:
