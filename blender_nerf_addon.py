@@ -122,18 +122,15 @@ def get_blender_camera_pose(region_3d, scale=1.0, offset=None):
     return blender_to_nerf_matrix(pose_blender, scale=scale, offset=offset)
 
 
-def get_blender_intrinsics(space, W, H):
+def get_blender_intrinsics(region_3d, W, H):
     """
-    Calculate [fx, fy, cx, cy] from Blender viewport lens.
-
-    Formula:  focal_px = W * lens_mm / sensor_width_mm
-    Default sensor width of Blender is 36mm (full-frame).
+    Calculate [fx, fy, cx, cy] from Blender viewport's projection matrix.
+    This guarantees exact FOV matching, preventing sliding during panning.
     """
-    lens         = space.lens   # focal length in mm
-    sensor_width = 36.0         # mm, Blender default
-
-    fx = W * lens / sensor_width
-    fy = fx   # square pixels
+    P = np.array(region_3d.window_matrix, dtype=np.float32)
+    
+    fx = (W / 2.0) * P[0, 0]
+    fy = (H / 2.0) * P[1, 1]
 
     return np.array([fx, fy, W / 2.0, H / 2.0], dtype=np.float32)
 
@@ -486,7 +483,7 @@ class NERF_OT_StartLiveRender(bpy.types.Operator):
             offset = [props.nerf_offset_x, props.nerf_offset_y, props.nerf_offset_z]
             pose   = get_blender_camera_pose(region_3d, scale=scale, offset=offset)
 
-            intrinsics = get_blender_intrinsics(space_3d, render_W, render_H)
+            intrinsics = get_blender_intrinsics(region_3d, render_W, render_H)
 
             bg_r, bg_g, bg_b = props.bg_color
             _active_state.set_camera(pose, intrinsics, render_W, render_H,
