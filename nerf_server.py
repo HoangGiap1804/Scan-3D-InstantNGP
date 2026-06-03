@@ -97,18 +97,13 @@ def encode_png(image: np.ndarray) -> bytes:
 def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor, transparent=False):
     """
     Render mot frame tu NeRF model.
-
-    transparent=False: tra ve [H, W, 3] float32  (RGB, co nen)
-    transparent=True:  tra ve [H, W, 4] float32  (RGBA, alpha = weights_sum)
-
-    Khi transparent=True, render voi nen den (bg=0) va trich xuat weights_sum
-    tu model.render() lam kenh alpha. Dung premultiplied alpha:
-        RGB = foreground * alpha  (vi render voi nen den)
-        A   = weights_sum
+    Luon tra ve tuple (image, depth_normalized):
+      image:            [H, W, 3] float32 (RGB) hoac [H, W, 4] float32 (RGBA)
+      depth_normalized: [H, W]   float32 trong [0, 1]   (0=near, 1=far ray)
     """
     from nerf.utils import get_rays
 
-    pose_t = torch.from_numpy(pose).unsqueeze(0).to(trainer.device)  # [1,4,4]
+    pose_t = torch.from_numpy(pose).unsqueeze(0).to(trainer.device)
     rays   = get_rays(pose_t, intrinsics, H, W, -1)
     data   = {'rays_o': rays['rays_o'], 'rays_d': rays['rays_d'], 'H': H, 'W': W}
 
@@ -117,59 +112,49 @@ def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor, transparent=F
         trainer.ema.store()
         trainer.ema.copy_to()
 
-    # Neu transparent, render voi nen den de lay RGB phan canh nguyen chat
-    if transparent:
-        render_bg = torch.zeros(3, dtype=torch.float32).to(trainer.device)
-    else:
-        render_bg = bg_color_tensor.to(trainer.device) if bg_color_tensor is not None else None
+    render_bg = (
+        torch.zeros(3, dtype=torch.float32).to(trainer.device)
+        if transparent
+        else (bg_color_tensor.to(trainer.device) if bg_color_tensor is not None else None)
+    )
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=trainer.fp16):
             outputs = trainer.model.render(
                 data['rays_o'], data['rays_d'],
-                staged=True,
-                bg_color=render_bg,
-                perturb=False,
+                staged=True, bg_color=render_bg, perturb=False,
                 **vars(trainer.opt)
             )
 
     if trainer.ema is not None:
         trainer.ema.restore()
 
-    pred_rgb = outputs['image'].reshape(H, W, 3)
+    # ── Depth (always available) ──────────────────────────────────────────────
+    pred_depth = outputs['depth'].reshape(H, W).detach().cpu().numpy()
+    pred_depth = np.clip(pred_depth, 0.0, 1.0).astype(np.float32)
 
+    # ── Color ─────────────────────────────────────────────────────────────────
     if transparent:
         if 'weights_sum' in outputs:
-            alpha_tensor = outputs['weights_sum'].reshape(H, W, 1)
+            alpha_t = outputs['weights_sum'].reshape(H, W, 1)
         else:
-            alpha_tensor = outputs['image'].reshape(H, W, 3).max(dim=2, keepdim=True)[0]
-            
-        pred_rgb_tensor = outputs['image'].reshape(H, W, 3)
-        
-        # Un-premultiply in torch
-        safe_alpha = torch.clamp(alpha_tensor, 1e-6, 1.0)
-        pred_rgb_straight = pred_rgb_tensor / safe_alpha
-        
+            alpha_t = outputs['image'].reshape(H, W, 3).max(dim=2, keepdim=True)[0]
+
+        rgb_t = outputs['image'].reshape(H, W, 3)
+        safe_a = torch.clamp(alpha_t, 1e-6, 1.0)
+        rgb_straight = rgb_t / safe_a
         if trainer.opt.color_space == 'linear':
-            pred_rgb_straight = linear_to_srgb(pred_rgb_straight)
-            
-        # Convert to numpy
-        pred_rgb_straight_np = pred_rgb_straight.detach().cpu().numpy()
-        alpha_np = alpha_tensor.detach().cpu().numpy()
-            
-        # Boost alpha slightly to make the object solid
-        alpha_boosted = np.clip(alpha_np * 1.5, 0.0, 1.0).astype(np.float32)
-        
-        # Re-premultiply with boosted alpha for Blender's ALPHA_PREMULT
-        pred_rgb_premult = pred_rgb_straight_np * alpha_boosted
-        
-        rgba = np.concatenate([pred_rgb_premult, alpha_boosted], axis=2)
-        return rgba
+            rgb_straight = linear_to_srgb(rgb_straight)
+        rgb_np  = rgb_straight.detach().cpu().numpy()
+        alpha_np = np.clip(alpha_t.detach().cpu().numpy() * 1.5, 0.0, 1.0).astype(np.float32)
+        image = np.concatenate([rgb_np * alpha_np, alpha_np], axis=2)  # premult RGBA
     else:
-        pred_rgb = outputs['image'].reshape(H, W, 3)
+        rgb_t = outputs['image'].reshape(H, W, 3)
         if trainer.opt.color_space == 'linear':
-            pred_rgb = linear_to_srgb(pred_rgb)
-        return pred_rgb.detach().cpu().numpy()
+            rgb_t = linear_to_srgb(rgb_t)
+        image = rgb_t.detach().cpu().numpy()  # [H, W, 3]
+
+    return image, pred_depth
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,12 +185,13 @@ class NeRFHandler(socketserver.StreamRequestHandler):
                 W           = int(req["W"])
                 H           = int(req["H"])
                 bg          = req.get("bg_color", [1.0, 1.0, 1.0])
-                transparent = bool(req.get("transparent", False))
-                bg_tensor   = torch.tensor(bg, dtype=torch.float32)
+                transparent  = bool(req.get("transparent",   False))
+                include_depth = bool(req.get("include_depth", False))
+                bg_tensor    = torch.tensor(bg, dtype=torch.float32)
 
                 t0 = time.perf_counter()
                 with self.server.gpu_lock:
-                    image = render_frame(
+                    image, depth = render_frame(
                         self.server.trainer,
                         pose, intrinsics, W, H,
                         bg_color_tensor=bg_tensor,
@@ -213,8 +199,13 @@ class NeRFHandler(socketserver.StreamRequestHandler):
                     )
                 dt_ms = (time.perf_counter() - t0) * 1000.0
 
-                png_bytes = encode_png(image)
-                send_framed(self.request, png_bytes)
+                # ── Gui color PNG ──────────────────────────────────────────
+                send_framed(self.request, encode_png(image))
+
+                # ── Gui depth bytes neu duoc yeu cau ──────────────────────
+                if include_depth and depth is not None:
+                    # Raw float32 bytes: H * W * 4 bytes, values in [0, 1]
+                    send_framed(self.request, depth.astype(np.float32).tobytes())
 
                 # ── Log ────────────────────────────────────────────────────
                 frame_count += 1

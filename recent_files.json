@@ -1,6 +1,6 @@
 [
     "/home/nqim/projects/GraduationProject/Scan-3D-InstantNGP/data/nerf_synthetic/ficus/transforms_train.json",
-    "/home/nqim/projects/GraduationProject/Scan-3D-InstantNGP/data/nerf_synthetic/chair/transforms_train.json",
     "/home/nqim/projects/GraduationProject/Scan-3D-InstantNGP/data/nerf_synthetic/drums/transforms_train.json",
+    "/home/nqim/projects/GraduationProject/Scan-3D-InstantNGP/data/nerf_synthetic/chair/transforms_train.json",
     "/home/nqim/projects/GraduationProject/Scan-3D-InstantNGP/data/nerf_synthetic/lego/transforms_train.json"
 ]

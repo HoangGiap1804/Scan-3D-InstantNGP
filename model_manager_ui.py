@@ -4,6 +4,7 @@ import shlex
 import threading
 import json
 import os
+import atexit
 
 HISTORY_FILE = "recent_files.json"
 TEXTURE_CACHE = {} 
@@ -26,28 +27,21 @@ def save_history(history):
 
 history_list = load_history()
 
+def update_and_render_history(file_path):
+    if file_path in history_list:
+        history_list.remove(file_path)
+    history_list.insert(0, file_path) 
+    
+    if len(history_list) > 12:
+        history_list.pop()
+        
+    save_history(history_list)
+    render_history_grid()
+
 def file_selected_cb(sender, app_data):
     file_path = app_data.get('file_path_name', "")
     if file_path:
-        if file_path in history_list:
-            history_list.remove(file_path)
-        history_list.insert(0, file_path) 
-        
-        if len(history_list) > 12:
-            history_list.pop()
-            
-        save_history(history_list)
-        render_history_grid()
-        run_model_callback(file_path)
-
-def history_button_cb(sender, app_data, user_data):
-    file_path = user_data
-    if file_path in history_list:
-        history_list.remove(file_path)
-    history_list.insert(0, file_path)
-    save_history(history_list)
-    render_history_grid()
-    run_model_callback(file_path)
+        update_and_render_history(file_path)
 
 def get_first_image_for_dataset(json_path):
     dir_path = os.path.dirname(json_path)
@@ -79,7 +73,10 @@ def get_first_image_for_dataset(json_path):
     return None
 
 def render_history_grid():
+    global active_server_file_path, active_server_share_btn, active_server_stop_btn
     dpg.delete_item("history_grid", children_only=True)
+    active_server_share_btn = None
+    active_server_stop_btn = None
     
     if not history_list:
         dpg.add_text("No recent files yet.", parent="history_grid", color=[150, 150, 150])
@@ -89,11 +86,10 @@ def render_history_grid():
     dpg.add_table_column(parent=table_id)
     dpg.add_table_column(parent=table_id)
     dpg.add_table_column(parent=table_id)
-    dpg.add_table_column(parent=table_id)
     
     row_id = None
     for i, file_path in enumerate(history_list):
-        if i % 4 == 0:
+        if i % 3 == 0:
             row_id = dpg.add_table_row(parent=table_id)
             
         display_name = os.path.basename(os.path.dirname(file_path))
@@ -116,39 +112,145 @@ def render_history_grid():
                     tex_id = None
                     
         # Tạo thiết kế dạng thẻ (Card) tuyệt đẹp bằng child_window
-        with dpg.child_window(parent=row_id, width=175, height=215, border=True, no_scrollbar=True) as card:
-            # Card theme will apply 12px padding, leaving exactly 150px for content (175 - 24 = 151)
+        with dpg.child_window(parent=row_id, width=230, height=310, border=True, no_scrollbar=True) as card:
+            # Card theme will apply 12px padding, leaving exactly 206px for content (230 - 24 = 206)
             if tex_id:
-                img_btn = dpg.add_image_button(tex_id, width=150, height=150, callback=history_button_cb, user_data=file_path)
+                dpg.add_image(tex_id, width=206, height=206)
             else:
-                img_btn = dpg.add_button(label="[ No Image ]", width=150, height=150, callback=history_button_cb, user_data=file_path)
+                with dpg.group(horizontal=False):
+                    dpg.add_spacer(height=78)
+                    dpg.add_text("       [ No Image ]", color=[150, 150, 150])
+                    dpg.add_spacer(height=78)
             
             # Label dưới hình
-            txt_btn = dpg.add_button(label=display_name, width=150, height=35, callback=history_button_cb, user_data=file_path)
+            txt_btn = dpg.add_button(label=display_name, width=206, height=35)
+            
+            with dpg.group(horizontal=True):
+                btn_train = dpg.add_button(label="Training", width=101, height=30, callback=run_training_cb, user_data=file_path)
+                
+                show_share = (file_path != active_server_file_path)
+                btn_server = dpg.add_button(label="Share Blender", width=101, height=30, callback=run_server_cb, user_data=file_path, show=show_share)
+                btn_stop = dpg.add_button(label="Stop Share", width=101, height=30, callback=stop_server_cb, user_data=file_path, show=not show_share)
+                
+                if not show_share:
+                    active_server_share_btn = btn_server
+                    active_server_stop_btn = btn_stop
             
             dpg.bind_item_theme(card, "card_theme")
-            dpg.bind_item_theme(img_btn, "image_btn_theme")
             dpg.bind_item_theme(txt_btn, "text_btn_theme")
+            dpg.bind_item_theme(btn_train, "action_btn_theme")
+            dpg.bind_item_theme(btn_server, "action_btn_theme")
+            dpg.bind_item_theme(btn_stop, "stop_btn_theme")
 
-def run_model_callback(file_path):
-    if not file_path:
-        return
+active_server_process = None
+active_server_file_path = None
+active_server_share_btn = None
+active_server_stop_btn = None
+running_processes = []
+
+def cleanup_all_processes():
+    for p in running_processes:
+        try:
+            p.terminate()
+            p.kill()
+        except:
+            pass
+
+atexit.register(cleanup_all_processes)
+
+def stop_server_cb(sender=None, app_data=None, user_data=None):
+    global active_server_process, active_server_file_path, active_server_share_btn, active_server_stop_btn
+    if active_server_process:
+        try:
+            active_server_process.terminate()
+        except:
+            pass
+        if active_server_process in running_processes:
+            running_processes.remove(active_server_process)
+        active_server_process = None
+        active_server_file_path = None
         
-    dir_path = os.path.dirname(file_path).replace('\\', '/')
-    new_workspace = os.path.basename(dir_path) or "my_model"
-    cmd = f'python main_nerf.py "{dir_path}" --workspace workspaces/{new_workspace} -O --bound 1.0 --scale 0.7 --dt_gamma 0 --color_space linear --error_map --gui'
+        dpg.set_value("server_status_text", "Server: Stopped")
+        dpg.configure_item("server_status_text", color=[200, 80, 80])
         
-    dpg.set_value("status_text", f"Status: Launching model {new_workspace}...")
-    
+        if active_server_share_btn and active_server_stop_btn:
+            try:
+                dpg.configure_item(active_server_share_btn, show=True)
+                dpg.configure_item(active_server_stop_btn, show=False)
+            except:
+                pass
+
+def monitor_server_process(proc):
+    global active_server_process, active_server_file_path, active_server_share_btn, active_server_stop_btn
+    proc.wait()
+    if proc in running_processes:
+        running_processes.remove(proc)
+    if active_server_process == proc:
+        active_server_process = None
+        active_server_file_path = None
+        
+        dpg.set_value("server_status_text", "Server: Stopped (Exited)")
+        dpg.configure_item("server_status_text", color=[200, 80, 80])
+        
+        if active_server_share_btn and active_server_stop_btn:
+            try:
+                dpg.configure_item(active_server_share_btn, show=True)
+                dpg.configure_item(active_server_stop_btn, show=False)
+            except:
+                pass
+
+def launch_command(cmd, status_msg):
+    dpg.set_value("status_text", f"Status: {status_msg}")
     def execute():
         try:
             args = shlex.split(cmd)
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            dpg.set_value("status_text", "Status: Command executed successfully! 3D window will appear.")
+            proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            running_processes.append(proc)
+            proc.wait()
+            if proc in running_processes:
+                running_processes.remove(proc)
+            dpg.set_value("status_text", "Status: Command executed successfully!")
         except Exception as e:
             dpg.set_value("status_text", f"Execution error: {str(e)}")
-            
     threading.Thread(target=execute, daemon=True).start()
+
+def run_training_cb(sender, app_data, user_data):
+    file_path = user_data
+    update_and_render_history(file_path)
+    if not file_path:
+        return
+    dir_path = os.path.dirname(file_path).replace('\\', '/')
+    new_workspace = os.path.basename(dir_path) or "my_model"
+    cmd = f'python main_nerf.py "{dir_path}" --workspace workspaces/{new_workspace} -O --bound 1.0 --scale 0.7 --dt_gamma 0 --error_map --gui'
+    launch_command(cmd, f"Launching training for {new_workspace}...")
+
+def run_server_cb(sender, app_data, user_data):
+    global active_server_process, active_server_file_path
+    
+    if active_server_process:
+        stop_server_cb()
+        
+    active_server_file_path = user_data
+    file_path = user_data
+    update_and_render_history(file_path)
+    if not file_path:
+        return
+    dir_path = os.path.dirname(file_path).replace('\\', '/')
+    new_workspace = os.path.basename(dir_path) or "my_model"
+    cmd = f'python nerf_server.py "{dir_path}" --workspace workspaces/{new_workspace} --test -O --bound 1.0 --scale 0.7 --dt_gamma 0'
+    
+    dpg.set_value("status_text", f"Status: Launching NeRF Server for {new_workspace}...")
+    try:
+        args = shlex.split(cmd)
+        active_server_process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        running_processes.append(active_server_process)
+        dpg.set_value("server_status_text", f"Server: Running ({new_workspace})")
+        dpg.configure_item("server_status_text", color=[50, 200, 50])
+        dpg.set_value("status_text", "Status: Server launched successfully!")
+        
+        threading.Thread(target=monitor_server_process, args=(active_server_process,), daemon=True).start()
+    except Exception as e:
+        dpg.set_value("status_text", f"Execution error: {str(e)}")
 
 
 dpg.create_context()
@@ -172,9 +274,25 @@ with dpg.theme(tag="image_btn_theme"):
 with dpg.theme(tag="text_btn_theme"):
     with dpg.theme_component(dpg.mvButton):
         dpg.add_theme_color(dpg.mvThemeCol_Button, (244, 248, 252))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (230, 240, 250))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (210, 230, 245))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (244, 248, 252))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (244, 248, 252))
         dpg.add_theme_color(dpg.mvThemeCol_Text, (20, 80, 160))
+        dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+
+with dpg.theme(tag="action_btn_theme"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 120, 215))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 140, 235))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 195))
+        dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
+        dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+
+with dpg.theme(tag="stop_btn_theme"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (200, 50, 50))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (220, 70, 70))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (180, 30, 30))
+        dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
         dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
 
 with dpg.texture_registry(show=False, tag="global_texture_registry"):
@@ -185,7 +303,7 @@ with dpg.font_registry():
         pass
     dpg.bind_font(default_font)
 
-with dpg.file_dialog(directory_selector=False, show=False, callback=file_selected_cb, tag="file_dialog_id", width=750, height=500):
+with dpg.file_dialog(directory_selector=False, show=False, callback=file_selected_cb, tag="file_dialog_id", width=800, height=600):
     dpg.add_file_extension(".json", color=(0, 120, 215, 255))
     dpg.add_file_extension(".*", color=(50, 50, 50, 255))
 
@@ -228,16 +346,18 @@ with dpg.window(label="NeRF Model Manager", tag="primary_window", width=850, hei
     dpg.add_text("3D Model Manager (Instant-NGP)", color=[0, 80, 180])
     dpg.add_spacer(height=5)
     
-    dpg.add_text("Recent selected files (Click image card to RUN immediately):", color=[0, 120, 50])
-    # Tăng chiều cao lên 250 để chứa được 1 hàng rưỡi (hiện thanh cuộn nhẹ)
-    with dpg.child_window(width=-1, height=260, tag="history_grid", border=False):
+    dpg.add_text("Recent selected files:", color=[0, 120, 50])
+    with dpg.child_window(width=-1, height=620, tag="history_grid", border=False):
         pass
     
     dpg.add_spacer(height=10)
     dpg.add_button(label="BROWSE AND SELECT NEW transforms.json FILE", callback=lambda: dpg.show_item("file_dialog_id"), width=-1, height=45)
     
-    dpg.add_spacer(height=20)
+    dpg.add_spacer(height=10)
     dpg.add_text("Status: Ready", tag="status_text", color=[130, 130, 130])
+    
+    with dpg.group(horizontal=True):
+        dpg.add_text("Server: Stopped", tag="server_status_text", color=[200, 80, 80])
 
 dpg.bind_theme(global_theme)
 
@@ -247,5 +367,6 @@ dpg.create_viewport(title='NeRF Model Launcher', width=850, height=750)
 dpg.setup_dearpygui()
 dpg.show_viewport()
 dpg.set_primary_window("primary_window", True)
+dpg.set_exit_callback(cleanup_all_processes)
 dpg.start_dearpygui()
 dpg.destroy_context()

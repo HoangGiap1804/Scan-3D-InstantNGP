@@ -168,3 +168,4 @@ data/*.7z
 data/
 videos/
 jobs.db
+*.json

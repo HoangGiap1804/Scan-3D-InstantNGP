@@ -1,34 +1,34 @@
 """
-blender_nerf_addon.py  ─  NeRF Live Render Add-on for Blender
+blender_nerf_addon.py  --  NeRF Live Render Add-on for Blender
 ==============================================================
-Display rendered images from NeRF Server directly in Blender Viewport.
+NeRF objects appear behind Blender 3D objects using GPU depth test.
+
+HOW DEPTH COMPOSITING WORKS (Blender 5.0 compatible):
+  POST_VIEW callback draws NeRF while scene depth buffer is still active.
+  The fragment shader writes gl_FragDepth = converted NeRF depth.
+  GPU depth test (LESS_EQUAL) automatically discards NeRF fragments that
+  are further than existing Blender geometry.  No depth buffer *reading*
+  needed - the GPU handles everything.
 
 Installation:
     Edit > Preferences > Add-ons > Install...
     Select this file -> Enable "NeRF Live Render"
 
-Usage:
-    1. Run nerf_server.py first
-    2. In the 3D Viewport, open the N-panel (press N) -> "NeRF" tab
-    3. Enter host/port -> press "Start NeRF View"
-    4. Rotate/zoom Blender viewport -> NeRF image updates accordingly
-
-Blender Requirement: 3.0+
+Blender requirement: 3.0+
 """
 
 bl_info = {
     "name": "NeRF Live Render",
     "author": "NeRF Project",
-    "version": (1, 1, 0),
+    "version": (3, 0, 0),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > NeRF",
-    "description": "Connect with NeRF Server to render and display directly in the Viewport",
+    "description": "Live NeRF render in Blender viewport with GPU depth compositing",
     "category": "Render",
 }
 
 import bpy
 import gpu
-import math
 import socket
 import struct
 import json
@@ -40,18 +40,100 @@ import numpy as np
 from gpu_extras.batch import batch_for_shader
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# GLSL Shaders
+# =============================================================================
+
+# ── Simple overlay (no depth) — used in POST_PIXEL ───────────────────────────
+_SIMPLE_VERT = """
+    uniform vec2 viewport_size;
+    in vec2 pos;
+    in vec2 texCoord;
+    out vec2 vUV;
+    void main() {
+        vec2 ndc = 2.0 * (pos / viewport_size) - 1.0;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+        vUV = texCoord;
+    }
+"""
+_SIMPLE_FRAG = """
+    uniform sampler2D image;
+    uniform float opacity;
+    in vec2 vUV;
+    out vec4 fragColor;
+    void main() {
+        vec4 c = texture(image, vUV);
+        if (c.a < 0.004) discard;
+        fragColor = vec4(c.rgb, c.a * opacity);
+    }
+"""
+
+# ── Depth-write shader — used in POST_VIEW ───────────────────────────────────
+# Writes gl_FragDepth so the GPU depth test automatically discards NeRF
+# fragments that are further away than existing Blender geometry.
+# No depth *reading* required — works on every Blender/GPU combination.
+_DEPTH_VERT = """
+    uniform vec2 viewport_size;
+    in vec2 pos;
+    in vec2 texCoord;
+    out vec2 vUV;
+    void main() {
+        vec2 ndc = 2.0 * (pos / viewport_size) - 1.0;
+        // z=0.5 is a placeholder; gl_FragDepth overrides it per-pixel.
+        gl_Position = vec4(ndc, 0.5, 1.0);
+        vUV = texCoord;
+    }
+"""
+_DEPTH_FRAG = """
+    uniform sampler2D nerf_color;
+    uniform sampler2D nerf_depth_tex;
+    uniform float opacity;
+    uniform float nerf_near;   // NeRF near in Blender units (= min_near / scale)
+    uniform float nerf_far;    // NeRF far  in Blender units (= 2*bound / scale)
+    uniform float bl_near;     // Blender clip_start
+    uniform float bl_far;      // Blender clip_end
+    in vec2 vUV;
+    out vec4 fragColor;
+
+    float nerf_to_gl_depth(float nd) {
+        // nd: NeRF normalized depth [0,1]
+        // Step 1: -> camera-space distance (Blender units, positive)
+        float z = max(nerf_near + nd * (nerf_far - nerf_near), 0.0001);
+        // Step 2: perspective -> OpenGL NDC depth [0,1]
+        //   z_ndc = (f+n)/(f-n) - 2fn / ((f-n) * z_cam)
+        //   depth_buf = 0.5 * z_ndc + 0.5
+        float fn   = bl_far + bl_near;
+        float fmn  = bl_far - bl_near;
+        float z_ndc = fn / fmn - (2.0 * bl_far * bl_near) / (fmn * z);
+        return clamp(0.5 * z_ndc + 0.5, 0.0, 1.0);
+    }
+
+    void main() {
+        vec4 c = texture(nerf_color, vUV);
+        if (c.a < 0.004) discard;
+
+        float nd = texture(nerf_depth_tex, vUV).r;
+        // Write converted depth -> GPU depth test (LESS_EQUAL) automatically
+        // discards this fragment if NeRF is behind a Blender object.
+        gl_FragDepth = nerf_to_gl_depth(nd);
+
+        fragColor = vec4(c.rgb, c.a * opacity);
+    }
+"""
+
+
+# =============================================================================
 # Constants
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
-TIMER_INTERVAL  = 0.033   # ~30 FPS target for modal timer
-REQUEST_TIMEOUT = 5.0     # socket timeout (seconds)
-MAX_RENDER_DIM  = 1024    # max render dimension
+TIMER_INTERVAL  = 0.033
+REQUEST_TIMEOUT = 5.0
+MAX_RENDER_DIM  = 1920
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# TCP Protocol helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# TCP helpers
+# =============================================================================
 
 def _recv_exactly(sock, n):
     buf = b""
@@ -65,162 +147,120 @@ def _recv_exactly(sock, n):
         buf += chunk
     return buf
 
-
 def recv_framed(sock):
-    header = _recv_exactly(sock, 4)
-    if header is None:
+    hdr = _recv_exactly(sock, 4)
+    if hdr is None:
         return None
-    length = struct.unpack(">I", header)[0]
-    return _recv_exactly(sock, length)
-
+    return _recv_exactly(sock, struct.unpack(">I", hdr)[0])
 
 def send_framed(sock, data):
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Camera helpers  --  EXACTLY like nerf_matrix_to_ngp() in provider.py
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Camera helpers (matches nerf_matrix_to_ngp in provider.py)
+# =============================================================================
 
 def blender_to_nerf_matrix(pose_blender, scale, offset):
-    """
-    Convert camera-to-world from Blender to NeRF (instant-ngp) coordinate system.
-
-    This is EXACTLY the nerf_matrix_to_ngp() transformation in provider.py:
-
-      Blender / transforms.json:   X=right, Y=up,      Z=backward  (OpenGL)
-      NeRF (ngp):                  X=right, Y=forward, Z=up
-
-    Row mapping:
-      NeRF row 0 <- Blender row Y (index 1),  inverted sign on columns 1 and 2
-      NeRF row 1 <- Blender row Z (index 2),  inverted sign on columns 1 and 2
-      NeRF row 2 <- Blender row X (index 0),  inverted sign on columns 1 and 2
-
-    Translation is multiplied by scale and offset is added.
-    """
     p = pose_blender
     return np.array([
-        [ p[1, 0], -p[1, 1], -p[1, 2],  p[1, 3] * scale + offset[0]],
-        [ p[2, 0], -p[2, 1], -p[2, 2],  p[2, 3] * scale + offset[1]],
-        [ p[0, 0], -p[0, 1], -p[0, 2],  p[0, 3] * scale + offset[2]],
+        [ p[1,0], -p[1,1], -p[1,2],  p[1,3]*scale + offset[0]],
+        [ p[2,0], -p[2,1], -p[2,2],  p[2,3]*scale + offset[1]],
+        [ p[0,0], -p[0,1], -p[0,2],  p[0,3]*scale + offset[2]],
         [0, 0, 0, 1],
     ], dtype=np.float32)
 
-
 def get_blender_camera_pose(region_3d, scale=1.0, offset=None):
-    """
-    Read camera pose from Blender viewport and convert to NeRF coordinate system.
-
-    Blender mathutils.Matrix is row-major.
-    view_matrix = world-to-camera  ->  invert to get camera-to-world.
-    """
     if offset is None:
         offset = [0.0, 0.0, 0.0]
-
     view = np.array(region_3d.view_matrix, dtype=np.float32).reshape(4, 4)
-    pose_blender = np.linalg.inv(view)   # camera-to-world, Blender convention
-    return blender_to_nerf_matrix(pose_blender, scale=scale, offset=offset)
-
+    return blender_to_nerf_matrix(np.linalg.inv(view), scale=scale, offset=offset)
 
 def get_blender_intrinsics(region_3d, W, H):
-    """
-    Calculate [fx, fy, cx, cy] from Blender viewport's projection matrix.
-    This guarantees exact FOV matching, preventing sliding during panning.
-    """
-    P = np.array(region_3d.window_matrix, dtype=np.float32)
-    
+    P  = np.array(region_3d.window_matrix, dtype=np.float32)
     fx = (W / 2.0) * P[0, 0]
     fy = (H / 2.0) * P[1, 1]
-
     return np.array([fx, fy, W / 2.0, H / 2.0], dtype=np.float32)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GPU Texture helper
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# GPU texture helpers
+# =============================================================================
 
 def numpy_to_gpu_texture(image):
-    """
-    Convert [H, W, 3] or [H, W, 4] float32 -> GPUTexture.
-    Flip Y because Blender uses bottom-left coordinate system.
-    NeRF returns top-left origin.
-    """
-    H, W   = image.shape[:2]
-    is_rgba = image.ndim == 3 and image.shape[2] == 4
-    img     = image[::-1, :, :].copy()   # flip Y
-
-    if is_rgba:
-        # Already has alpha in 4th channel
+    """[H,W,3] or [H,W,4] float32 -> GPUTexture (flips Y)."""
+    H, W = image.shape[:2]
+    img  = image[::-1, :, :].copy()
+    if image.shape[2] == 4:
         rgba = img.astype(np.float32)
     else:
-        # Add alpha = 1.0
-        rgba      = np.ones((H, W, 4), dtype=np.float32)
+        rgba = np.ones((H, W, 4), dtype=np.float32)
         rgba[:, :, :3] = img
-
-    flat = rgba.flatten()
-    buf  = gpu.types.Buffer("FLOAT", len(flat), flat)
+    buf = gpu.types.Buffer("FLOAT", H * W * 4, rgba.flatten())
     return gpu.types.GPUTexture((W, H), format="RGBA32F", data=buf)
 
+def numpy_depth_to_gpu_texture(depth_arr):
+    """[H,W] float32 -> GPUTexture (R32F, no Y-flip needed: already flipped with color)."""
+    H, W = depth_arr.shape
+    # Flip Y to match the color texture (which was flipped in numpy_to_gpu_texture)
+    flipped = depth_arr[::-1, :].copy()
+    buf = gpu.types.Buffer("FLOAT", H * W, flipped.flatten())
+    return gpu.types.GPUTexture((W, H), format="R32F", data=buf)
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
 # PNG decode
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def decode_png_to_numpy(png_bytes):
-    """PNG bytes -> [H, W, 3] or [H, W, 4] float32 [0,1]"""
+    """PNG bytes -> [H,W,3] or [H,W,4] float32 [0,1]."""
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(png_bytes))
-        # Keep RGBA if present (transparent render)
-        if img.mode == 'RGBA':
-            arr = np.array(img.convert('RGBA'), dtype=np.float32) / 255.0  # [H,W,4]
-        else:
-            arr = np.array(img.convert('RGB'),  dtype=np.float32) / 255.0  # [H,W,3]
-        return arr
+        mode = 'RGBA' if img.mode == 'RGBA' else 'RGB'
+        return np.array(img.convert(mode), dtype=np.float32) / 255.0
     except ImportError:
         import cv2
         arr = np.frombuffer(png_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise RuntimeError("cv2.imdecode failed")
-        if img.shape[2] == 4:  # BGRA
+        if img.ndim == 3 and img.shape[2] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-        else:                   # BGR
+        elif img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img.astype(np.float32) / 255.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Shared State between Network Thread and Blender UI Thread
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Shared State
+# =============================================================================
 
 class SharedState:
-    """Thread-safe data sharing between network thread and UI thread."""
-
     def __init__(self):
-        self._lock   = threading.Lock()
-        self.running = False
+        self._lock    = threading.Lock()
+        self.running  = False
 
-        # Camera data (set by UI thread)
-        self.latest_pose       = None
-        self.latest_intrinsics = None
-        self.render_W          = 512
-        self.render_H          = 512
-        self.bg_color          = [1.0, 1.0, 1.0]
-        self.transparent       = False   # whether to call RGBA render or RGB
+        self.latest_pose        = None
+        self.latest_intrinsics  = None
+        self.render_W           = 512
+        self.render_H           = 512
+        self.bg_color           = [1.0, 1.0, 1.0]
+        self.transparent        = True
+        self.include_depth      = False
 
-        # Latest rendered image (set by network thread)
-        self.latest_image  = None
-        self.image_updated = False
-        self.image_w       = 512   # actual pixel width of last render
-        self.image_h       = 512   # actual pixel height of last render
+        self.latest_image   = None
+        self.latest_depth   = None
+        self.image_updated  = False
+        self.image_w        = 512
+        self.image_h        = 512
 
-        # Status
         self.fps    = 0.0
         self.status = "Disconnected"
         self.error  = ""
 
-    def set_camera(self, pose, intrinsics, W, H, bg, transparent=False):
+    def set_camera(self, pose, intrinsics, W, H, bg,
+                   transparent=True, include_depth=False):
         with self._lock:
             self.latest_pose       = pose
             self.latest_intrinsics = intrinsics
@@ -228,24 +268,27 @@ class SharedState:
             self.render_H          = H
             self.bg_color          = bg
             self.transparent       = transparent
+            self.include_depth     = include_depth
 
     def get_camera(self):
         with self._lock:
             return (self.latest_pose, self.latest_intrinsics,
-                    self.render_W, self.render_H, self.bg_color, self.transparent)
+                    self.render_W, self.render_H, self.bg_color,
+                    self.transparent, self.include_depth)
 
-    def set_image(self, image):
+    def set_render(self, image, depth=None):
         with self._lock:
             self.latest_image  = image
+            self.latest_depth  = depth
             self.image_updated = True
             self.image_h, self.image_w = image.shape[:2]
 
-    def get_image_if_new(self):
+    def get_render_if_new(self):
         with self._lock:
             if self.image_updated:
                 self.image_updated = False
-                return self.latest_image, self.image_w, self.image_h
-            return None, None, None
+                return self.latest_image, self.latest_depth, self.image_w, self.image_h
+            return None, None, None, None
 
     def get_image_size(self):
         with self._lock:
@@ -258,57 +301,60 @@ class SharedState:
             self.fps    = fps
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Network Thread
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def network_thread_fn(host, port, state):
-    """
-    Runs in background thread.
-    Connects to NeRF server, sends requests continuously and receives rendered images.
-    """
     sock = None
     try:
         state.set_status("Connecting...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(REQUEST_TIMEOUT)
         sock.connect((host, port))
-        sock.settimeout(REQUEST_TIMEOUT)
         state.set_status(f"Connected to {host}:{port}")
         print(f"[NeRF Addon] Connected to {host}:{port}")
 
         t_prev = time.perf_counter()
-
         while state.running:
-            pose, intrinsics, W, H, bg, transparent = state.get_camera()
-
+            pose, intrinsics, W, H, bg, transparent, include_depth = state.get_camera()
             if pose is None:
                 time.sleep(0.01)
                 continue
 
-            req     = {"pose": pose.tolist(), "intrinsics": intrinsics.tolist(),
-                       "W": W, "H": H, "bg_color": bg, "transparent": transparent}
-            payload = json.dumps(req).encode("utf-8")
-            send_framed(sock, payload)
+            req = {
+                "pose":          pose.tolist(),
+                "intrinsics":    intrinsics.tolist(),
+                "W": W, "H": H,
+                "bg_color":      bg,
+                "transparent":   transparent,
+                "include_depth": include_depth,
+            }
+            send_framed(sock, json.dumps(req).encode("utf-8"))
 
             png_bytes = recv_framed(sock)
             if png_bytes is None:
-                state.set_status("Error: Connection lost", error="Server closed connection")
+                state.set_status("Error: connection lost", error="Server closed")
                 break
-
             image = decode_png_to_numpy(png_bytes)
-            state.set_image(image)
 
-            t_now = time.perf_counter()
-            fps   = 1.0 / max(t_now - t_prev, 1e-6)
+            depth = None
+            if include_depth:
+                depth_bytes = recv_framed(sock)
+                if depth_bytes is not None:
+                    depth = np.frombuffer(depth_bytes, dtype=np.float32).reshape(H, W)
+
+            state.set_render(image, depth)
+            t_now  = time.perf_counter()
+            fps    = 1.0 / max(t_now - t_prev, 1e-6)
             t_prev = t_now
             state.set_status(f"Rendering | {W}x{H}", fps=fps)
 
     except ConnectionRefusedError:
-        state.set_status("Error: Connection refused",
-                         error=f"Could not connect to {host}:{port}. Is the server running?")
+        state.set_status("Error: refused",
+                         error=f"Cannot connect to {host}:{port}")
     except socket.timeout:
-        state.set_status("Error: Timeout", error="Server did not respond")
+        state.set_status("Error: timeout", error="Server did not respond")
     except Exception as exc:
         state.set_status(f"Error: {type(exc).__name__}", error=str(exc))
         import traceback; traceback.print_exc()
@@ -320,117 +366,185 @@ def network_thread_fn(host, port, state):
         print("[NeRF Addon] Network thread stopped.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Draw Callback
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_image_shader():
-    for name in ("IMAGE", "2D_IMAGE"):
-        try:
-            return gpu.shader.from_builtin(name)
-        except Exception:
-            continue
-    raise RuntimeError("IMAGE shader not found")
-
-
-def build_quad_batch(shader, x, y, w, h):
-    verts   = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-    uvs     = [(0, 0), (1,   0), (1,   1   ), (0, 1   )]
-    indices = [(0, 1, 2), (0, 2, 3)]
-    return batch_for_shader(shader, "TRIS",
-                            {"pos": verts, "texCoord": uvs},
-                            indices=indices)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Global draw state
-# ──────────────────────────────────────────────────────────────────────────────
-
-_active_state     = None
-_draw_handle      = None
-_gpu_texture      = None
-_shader           = None
-_batch            = None
-_last_draw_key    = None
-_is_transparent_mode = False   # track current blend mode
-
+# =============================================================================
+# Display helpers
+# =============================================================================
 
 def _compute_draw_rect(rw, rh, iw, ih, mode):
-    """
-    Calculate (x, y, w, h) to draw image onto the viewport.
-
-    mode:
-      'FILL'   - stretch image to always fill viewport (legacy behavior)
-      'FIT'    - preserve aspect ratio, fit inside viewport (default)
-      'CORNER' - display in bottom-right corner at original size (iw x ih)
-    """
     if mode == 'FILL':
         return 0, 0, rw, rh
-
     elif mode == 'FIT':
-        # Keep aspect ratio, not larger than viewport
-        scale = min(rw / iw, rh / ih)
-        dw = int(iw * scale)
-        dh = int(ih * scale)
-        x  = (rw - dw) // 2
-        y  = (rh - dh) // 2
-        return x, y, dw, dh
+        s  = min(rw / iw, rh / ih)
+        dw, dh = int(iw * s), int(ih * s)
+        return (rw - dw) // 2, (rh - dh) // 2, dw, dh
+    else:  # CORNER
+        dw, dh = min(iw, rw), min(ih, rh)
+        return rw - dw, 0, dw, dh
 
-    else:  # 'CORNER'
-        # Display at bottom-right corner, original size (iw x ih)
-        # If too large, downscale to fit viewport
-        dw = min(iw, rw)
-        dh = min(ih, rh)
-        x  = rw - dw
-        y  = 0
-        return x, y, dw, dh
+def _build_batch(shader, x, y, w, h):
+    verts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+    uvs   = [(0, 0), (1,   0), (1,   1   ), (0, 1   )]
+    return batch_for_shader(shader, "TRIS",
+                            {"pos": verts, "texCoord": uvs},
+                            indices=[(0,1,2),(0,2,3)])
 
 
-def draw_nerf_viewport(context):
-    """Draw callback: draw NeRF image onto viewport (POST_PIXEL)."""
-    global _active_state, _gpu_texture, _shader, _batch, _last_draw_key
+# =============================================================================
+# Global render state
+# =============================================================================
 
-    if _active_state is None or _gpu_texture is None:
-        return
+_active_state   = None
+_handle_pixel   = None   # POST_PIXEL: simple color overlay
+_handle_view    = None   # POST_VIEW:  depth-aware drawing
 
-    props   = context.scene.nerf_props
-    opacity = props.opacity
-    mode    = props.display_mode
-    region  = context.region
-    rw, rh  = region.width, region.height
-    iw, ih  = _active_state.get_image_size()
+_gpu_color_tex  = None   # NeRF color   (RGBA32F)
+_gpu_depth_tex  = None   # NeRF depth   (R32F)
 
-    if _shader is None:
-        try:
-            _shader = get_image_shader()
-        except Exception as e:
-            print(f"[NeRF Addon] Shader error: {e}")
-            return
+_simple_shader  = None
+_depth_shader   = None
 
-    draw_key = (rw, rh, iw, ih, mode)
-    if draw_key != _last_draw_key:
-        x, y, dw, dh = _compute_draw_rect(rw, rh, iw, ih, mode)
-        _batch        = build_quad_batch(_shader, x, y, dw, dh)
-        _last_draw_key = draw_key
+_simple_batch   = None
+_depth_batch    = None
+_simple_key     = None
+_depth_key      = None
 
-    if _batch is None:
-        x, y, dw, dh = _compute_draw_rect(rw, rh, iw, ih, mode)
-        _batch = build_quad_batch(_shader, x, y, dw, dh)
+_is_premult     = False
 
-    gpu.state.blend_set("ALPHA_PREMULT" if _is_transparent_mode else "ALPHA")
-    _shader.bind()
+
+# =============================================================================
+# Draw Callbacks
+# =============================================================================
+
+def _get_space_clips(context):
+    """Return (near, far) from the active VIEW_3D space."""
     try:
-        _shader.uniform_float("color", (1.0, 1.0, 1.0, opacity))
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                s = area.spaces.active
+                return s.clip_start, s.clip_end
     except Exception:
         pass
-    _shader.uniform_sampler("image", _gpu_texture)
-    _batch.draw(_shader)
+    return 0.1, 1000.0
+
+
+def draw_nerf_simple(context):
+    """
+    POST_PIXEL callback: plain color overlay, no depth compositing.
+    Skipped when depth_compositing is enabled (POST_VIEW handles that).
+    """
+    global _active_state, _gpu_color_tex
+    global _simple_shader, _simple_batch, _simple_key, _is_premult
+
+    if _active_state is None or _gpu_color_tex is None:
+        return
+    if not hasattr(context.scene, 'nerf_props'):
+        return
+    props = context.scene.nerf_props
+    if props.depth_compositing:
+        return   # Handled by POST_VIEW callback
+
+    region = context.region
+    rw, rh = region.width, region.height
+    iw, ih = _active_state.get_image_size()
+    mode   = props.display_mode
+    key    = (rw, rh, iw, ih, mode)
+
+    if _simple_shader is None:
+        try:
+            _simple_shader = gpu.types.GPUShader(_SIMPLE_VERT, _SIMPLE_FRAG)
+        except Exception as e:
+            print(f"[NeRF] Simple shader error: {e}")
+            return
+
+    if key != _simple_key or _simple_batch is None:
+        x, y, dw, dh = _compute_draw_rect(rw, rh, iw, ih, mode)
+        _simple_batch = _build_batch(_simple_shader, x, y, dw, dh)
+        _simple_key   = key
+
+    blend = "ALPHA_PREMULT" if _is_premult else "ALPHA"
+    gpu.state.blend_set(blend)
+    _simple_shader.bind()
+    _simple_shader.uniform_sampler("image",         _gpu_color_tex)
+    _simple_shader.uniform_float("opacity",         props.opacity)
+    _simple_shader.uniform_float("viewport_size",   (rw, rh))
+    if _simple_batch:
+        _simple_batch.draw(_simple_shader)
     gpu.state.blend_set("NONE")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def draw_nerf_depth(context):
+    """
+    POST_VIEW callback: depth-aware compositing using GPU depth test.
+
+    How it works:
+      - Fires after Blender has rendered its 3D scene into the viewport FBO.
+      - The depth buffer now contains Blender scene depth values.
+      - We draw the NeRF quad and write gl_FragDepth = converted NeRF depth.
+      - GPU depth test (LESS_EQUAL) automatically discards NeRF pixels that
+        are further away than existing Blender geometry.
+      - No depth buffer *reading* required — 100% GPU-side, works on
+        Blender 3.0 – 5.x regardless of bgl availability.
+    """
+    global _active_state, _gpu_color_tex, _gpu_depth_tex
+    global _depth_shader, _depth_batch, _depth_key, _is_premult
+
+    if _active_state is None or _gpu_color_tex is None or _gpu_depth_tex is None:
+        return
+    if not hasattr(context.scene, 'nerf_props'):
+        return
+    props = context.scene.nerf_props
+    if not props.depth_compositing or not props.is_running:
+        return
+
+    region = context.region
+    rw, rh = region.width, region.height
+    iw, ih = _active_state.get_image_size()
+    mode   = props.display_mode
+    key    = (rw, rh, iw, ih, mode)
+
+    if _depth_shader is None:
+        try:
+            _depth_shader = gpu.types.GPUShader(_DEPTH_VERT, _DEPTH_FRAG)
+        except Exception as e:
+            print(f"[NeRF] Depth shader compile error: {e}")
+            return
+
+    if key != _depth_key or _depth_batch is None:
+        x, y, dw, dh = _compute_draw_rect(rw, rh, iw, ih, mode)
+        _depth_batch  = _build_batch(_depth_shader, x, y, dw, dh)
+        _depth_key    = key
+
+    bl_near, bl_far = _get_space_clips(context)
+
+    blend = "ALPHA_PREMULT" if _is_premult else "ALPHA"
+    gpu.state.blend_set(blend)
+    # LESS_EQUAL: pass if NeRF depth <= existing depth (NeRF in front or same)
+    gpu.state.depth_test_set("LESS_EQUAL")
+    # Don't overwrite Blender's scene depth so subsequent draws stay correct
+    gpu.state.depth_mask_set(False)
+
+    _depth_shader.bind()
+    _depth_shader.uniform_sampler("nerf_color",    _gpu_color_tex)
+    _depth_shader.uniform_sampler("nerf_depth_tex", _gpu_depth_tex)
+    _depth_shader.uniform_float("opacity",         props.opacity)
+    _depth_shader.uniform_float("nerf_near",       props.nerf_depth_near)
+    _depth_shader.uniform_float("nerf_far",        props.nerf_depth_far)
+    _depth_shader.uniform_float("bl_near",         bl_near)
+    _depth_shader.uniform_float("bl_far",          bl_far)
+    _depth_shader.uniform_float("viewport_size",   (rw, rh))
+
+    if _depth_batch:
+        _depth_batch.draw(_depth_shader)
+
+    # Restore state
+    gpu.state.depth_test_set("NONE")
+    gpu.state.depth_mask_set(True)
+    gpu.state.blend_set("NONE")
+
+
+# =============================================================================
 # Operators
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 class NERF_OT_StartLiveRender(bpy.types.Operator):
     """Start NeRF Server connection and display render in viewport"""
@@ -441,27 +555,26 @@ class NERF_OT_StartLiveRender(bpy.types.Operator):
     _timer = None
 
     def modal(self, context, event):
-        global _active_state, _gpu_texture, _shader, _batch, _last_region_size
+        global _active_state, _gpu_color_tex, _gpu_depth_tex
+        global _simple_batch, _depth_batch, _simple_key, _depth_key, _is_premult
 
         if _active_state is None or not _active_state.running:
             self.cancel(context)
             return {"CANCELLED"}
 
         if event.type == "TIMER":
-            props     = context.scene.nerf_props
-            region_3d = None
-            space_3d  = None
+            props      = context.scene.nerf_props
+            region_3d  = None
             region_win = None
 
             for area in context.screen.areas:
                 if area.type == "VIEW_3D":
-                    for region in area.regions:
-                        if region.type == "WINDOW":
-                            space = area.spaces.active
-                            if hasattr(space, "region_3d"):
-                                region_3d  = space.region_3d
-                                region_win = region
-                                space_3d   = space
+                    for r in area.regions:
+                        if r.type == "WINDOW":
+                            s = area.spaces.active
+                            if hasattr(s, "region_3d"):
+                                region_3d  = s.region_3d
+                                region_win = r
                                 break
                     if region_3d:
                         break
@@ -469,34 +582,37 @@ class NERF_OT_StartLiveRender(bpy.types.Operator):
             if region_3d is None:
                 return {"PASS_THROUGH"}
 
-            render_W = min(props.render_width,  MAX_RENDER_DIM)
-            render_H = min(props.render_height, MAX_RENDER_DIM)
-
-            # If using viewport size, override render W/H
             if props.use_viewport_size:
                 ds = max(0.1, min(1.0, props.viewport_downscale))
                 render_W = max(64, int(region_win.width  * ds))
                 render_H = max(64, int(region_win.height * ds))
+            else:
+                render_W = min(props.render_width,  MAX_RENDER_DIM)
+                render_H = min(props.render_height, MAX_RENDER_DIM)
 
-            # Get camera pose using exact provider.py transformation
             scale  = props.nerf_scale
             offset = [props.nerf_offset_x, props.nerf_offset_y, props.nerf_offset_z]
             pose   = get_blender_camera_pose(region_3d, scale=scale, offset=offset)
-
-            intrinsics = get_blender_intrinsics(region_3d, render_W, render_H)
+            intr   = get_blender_intrinsics(region_3d, render_W, render_H)
 
             bg_r, bg_g, bg_b = props.bg_color
-            _active_state.set_camera(pose, intrinsics, render_W, render_H,
-                                     [bg_r, bg_g, bg_b],
-                                     transparent=props.transparent)
+            _active_state.set_camera(
+                pose, intr, render_W, render_H,
+                [bg_r, bg_g, bg_b],
+                transparent   = props.transparent,
+                include_depth = props.depth_compositing,
+            )
 
-            new_image, iw, ih = _active_state.get_image_if_new()
-            if new_image is not None:
-                _gpu_texture      = numpy_to_gpu_texture(new_image)
-                _is_transparent_mode = (new_image.ndim == 3 and new_image.shape[2] == 4)
-                _shader           = None
-                _batch            = None
-                _last_draw_key    = None
+            img, dep, iw, ih = _active_state.get_render_if_new()
+            if img is not None:
+                _gpu_color_tex = numpy_to_gpu_texture(img)
+                _is_premult    = (img.ndim == 3 and img.shape[2] == 4)
+                _gpu_depth_tex = (numpy_depth_to_gpu_texture(dep)
+                                  if dep is not None else None)
+                _simple_batch  = None
+                _depth_batch   = None
+                _simple_key    = None
+                _depth_key     = None
                 for area in context.screen.areas:
                     if area.type == "VIEW_3D":
                         area.tag_redraw()
@@ -504,218 +620,218 @@ class NERF_OT_StartLiveRender(bpy.types.Operator):
         return {"PASS_THROUGH"}
 
     def invoke(self, context, event):
-        global _active_state, _draw_handle, _gpu_texture, _shader, _batch
+        global _active_state, _handle_pixel, _handle_view
+        global _gpu_color_tex, _gpu_depth_tex
+        global _simple_shader, _depth_shader
+        global _simple_batch, _depth_batch
 
         props = context.scene.nerf_props
-        host  = props.host
-        port  = props.port
 
-        _active_state = SharedState()
+        _active_state  = SharedState()
         _active_state.running = True
-        _gpu_texture = None
-        _shader      = None
-        _batch       = None
+        _gpu_color_tex = None
+        _gpu_depth_tex = None
+        _simple_shader = None
+        _depth_shader  = None
+        _simple_batch  = None
+        _depth_batch   = None
 
-        _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-            draw_nerf_viewport, (context,), "WINDOW", "POST_PIXEL"
+        # POST_PIXEL: simple overlay (used when depth_compositing=False)
+        _handle_pixel = bpy.types.SpaceView3D.draw_handler_add(
+            draw_nerf_simple, (context,), "WINDOW", "POST_PIXEL"
+        )
+        # POST_VIEW: depth-aware drawing (used when depth_compositing=True)
+        # Fires BEFORE overlays so scene depth buffer is still intact.
+        _handle_view = bpy.types.SpaceView3D.draw_handler_add(
+            draw_nerf_depth, (context,), "WINDOW", "POST_VIEW"
         )
 
-        t = threading.Thread(
+        threading.Thread(
             target=network_thread_fn,
-            args=(host, port, _active_state),
+            args=(props.host, props.port, _active_state),
             daemon=True,
-        )
-        t.start()
+        ).start()
 
         self._timer = context.window_manager.event_timer_add(
             TIMER_INTERVAL, window=context.window
         )
         context.window_manager.modal_handler_add(self)
-
         props.is_running = True
-        print(f"[NeRF Addon] Starting. Connecting to {host}:{port}...")
+        print(f"[NeRF Addon] Connecting to {props.host}:{props.port} ...")
         return {"RUNNING_MODAL"}
 
     def cancel(self, context):
-        global _active_state, _draw_handle, _gpu_texture
+        global _active_state, _handle_pixel, _handle_view
+        global _gpu_color_tex, _gpu_depth_tex
 
         if self._timer:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
-
-        if _draw_handle:
-            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
-            _draw_handle = None
-
+        for handle_attr in ('_handle_pixel', '_handle_view'):
+            h = globals().get(handle_attr)
+            if h:
+                try:
+                    bpy.types.SpaceView3D.draw_handler_remove(h, "WINDOW")
+                except Exception:
+                    pass
+                globals()[handle_attr] = None
         if _active_state:
             _active_state.running = False
             _active_state = None
+        _gpu_color_tex = None
+        _gpu_depth_tex = None
 
-        _gpu_texture = None
-
-        context.scene.nerf_props.is_running = False
+        if hasattr(context, 'scene') and hasattr(context.scene, 'nerf_props'):
+            context.scene.nerf_props.is_running = False
         for area in context.screen.areas:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
 
 
 class NERF_OT_StopLiveRender(bpy.types.Operator):
-    """Stop NeRF connection and remove overlay from viewport"""
+    """Stop NeRF connection and remove overlay"""
     bl_idname  = "nerf.stop_live_render"
     bl_label   = "Stop"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        global _active_state, _draw_handle, _gpu_texture
+        global _active_state, _handle_pixel, _handle_view
+        global _gpu_color_tex, _gpu_depth_tex
 
         if _active_state:
             _active_state.running = False
-        if _draw_handle:
-            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
-            _draw_handle = None
-        _gpu_texture = None
+        for handle_attr in ('_handle_pixel', '_handle_view'):
+            h = globals().get(handle_attr)
+            if h:
+                try:
+                    bpy.types.SpaceView3D.draw_handler_remove(h, "WINDOW")
+                except Exception:
+                    pass
+                globals()[handle_attr] = None
+        _gpu_color_tex = None
+        _gpu_depth_tex = None
 
         context.scene.nerf_props.is_running = False
         for area in context.screen.areas:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
-
         self.report({"INFO"}, "NeRF Live Render stopped")
         return {"FINISHED"}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Properties
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 class NeRFProperties(bpy.types.PropertyGroup):
-    host: bpy.props.StringProperty(
-        name="Host", default="127.0.0.1",
-        description="IP address of NeRF server",
-    )
-    port: bpy.props.IntProperty(
-        name="Port", default=6789, min=1024, max=65535,
-        description="TCP port of NeRF server",
-    )
-    render_width: bpy.props.IntProperty(
-        name="W", default=512, min=64, max=MAX_RENDER_DIM,
-        description="Width (only used when 'Use Viewport Size' is disabled)",
-    )
-    render_height: bpy.props.IntProperty(
-        name="H", default=512, min=64, max=MAX_RENDER_DIM,
-        description="Height (only used when 'Use Viewport Size' is disabled)",
-    )
+    host: bpy.props.StringProperty(name="Host", default="127.0.0.1")
+    port: bpy.props.IntProperty(name="Port", default=6789, min=1024, max=65535)
 
-    # === RENDER SIZE AUTO ===
     use_viewport_size: bpy.props.BoolProperty(
-        name="Use Viewport Size",
-        description="Automatically use Viewport size as render resolution",
+        name="Auto Viewport Size",
+        description="Use viewport dimensions as render resolution",
         default=True,
     )
     viewport_downscale: bpy.props.FloatProperty(
         name="Downscale",
-        description="Downscale factor: 1.0 = full resolution, 0.5 = half size (increases FPS)",
-        default=0.5, min=0.1, max=1.0, step=5, precision=2, subtype="FACTOR",
+        description="1.0 = full viewport resolution, 0.5 = half (faster)",
+        default=0.5, min=0.1, max=1.0, subtype="FACTOR",
     )
+    render_width:  bpy.props.IntProperty(name="W", default=512, min=64, max=MAX_RENDER_DIM)
+    render_height: bpy.props.IntProperty(name="H", default=512, min=64, max=MAX_RENDER_DIM)
 
-    # === SCALE & OFFSET ===
     nerf_scale: bpy.props.FloatProperty(
         name="--scale",
-        description=(
-            "The --scale value when running nerf_server.py (e.g., 0.7).\n"
-            "Must match exactly so Blender units align with NeRF space.\n"
-            "Default: 0.33 (fox dataset), this project uses 0.7"
-        ),
-        default=0.7, min=0.001, max=10.0, step=1, precision=4,
+        description="Must match --scale when running nerf_server.py",
+        default=0.7, min=0.001, max=10.0, precision=4,
     )
-    nerf_offset_x: bpy.props.FloatProperty(
-        name="Offset X",
-        description="The --offset[0] value when training NeRF",
-        default=0.0, step=1, precision=3,
-    )
-    nerf_offset_y: bpy.props.FloatProperty(
-        name="Offset Y",
-        description="The --offset[1] value when training NeRF",
-        default=0.0, step=1, precision=3,
-    )
-    nerf_offset_z: bpy.props.FloatProperty(
-        name="Offset Z",
-        description="The --offset[2] value when training NeRF",
-        default=0.0, step=1, precision=3,
-    )
+    nerf_offset_x: bpy.props.FloatProperty(name="Offset X", default=0.0, precision=3)
+    nerf_offset_y: bpy.props.FloatProperty(name="Offset Y", default=0.0, precision=3)
+    nerf_offset_z: bpy.props.FloatProperty(name="Offset Z", default=0.0, precision=3)
 
-    # === BACKGROUND / TRANSPARENCY ===
     transparent: bpy.props.BoolProperty(
-        name="Transparent Background",
-        description=(
-            "Render with transparent background (RGBA). "
-            "NeRF renders with black background and uses weights_sum as actual alpha. "
-            "Disable to use a custom background color."
-        ),
+        name="Transparent BG",
+        description="Render with transparent background (RGBA)",
         default=True,
     )
     bg_color: bpy.props.FloatVectorProperty(
-        name="Background Color", default=(1.0, 1.0, 1.0),
+        name="BG Color", default=(1.0, 1.0, 1.0),
         min=0.0, max=1.0, subtype="COLOR",
-        description="Background color (only used when Transparent Background = False)",
     )
 
-    # === DISPLAY ===
     display_mode: bpy.props.EnumProperty(
-        name="Display",
-        description="How to display NeRF images in the viewport",
+        name="Display Mode",
         items=[
-            ('FILL',   "Fill Viewport (FILL)", "Fill entire viewport — recommended with Viewport Size"),
-            ('FIT',    "Fit Window (FIT)",    "Keep aspect ratio, fit inside viewport, centered"),
-            ('CORNER', "Corner of Screen",     "Bottom-right corner, original size"),
+            ('FILL',   "Fill",   "Fill viewport"),
+            ('FIT',    "Fit",    "Preserve aspect ratio, centred"),
+            ('CORNER', "Corner", "Bottom-right corner"),
         ],
         default='FILL',
     )
     opacity: bpy.props.FloatProperty(
         name="Opacity", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
-        description="Opacity of the NeRF image overlay",
     )
+
+    # ── Depth Compositing ────────────────────────────────────────────────────
+    depth_compositing: bpy.props.BoolProperty(
+        name="Depth Compositing",
+        description=(
+            "NeRF objects appear behind Blender 3D objects.\n"
+            "Uses GPU depth test — works on Blender 3.0 – 5.x without any extra modules."
+        ),
+        default=False,
+    )
+    nerf_depth_near: bpy.props.FloatProperty(
+        name="NeRF Near (Blender units)",
+        description="Camera distance at NeRF depth=0.  Formula: min_near / scale  (e.g. 0.2/0.7 ≈ 0.29)",
+        default=0.29, min=0.001, max=100.0, precision=3,
+    )
+    nerf_depth_far: bpy.props.FloatProperty(
+        name="NeRF Far (Blender units)",
+        description="Camera distance at NeRF depth=1.  Formula: 2×bound / scale  (e.g. 2×1/0.7 ≈ 2.86)",
+        default=2.86, min=0.1, max=1000.0, precision=3,
+    )
+
     is_running: bpy.props.BoolProperty(name="Is Running", default=False)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Panel
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 class VIEW3D_PT_NeRFLiveRender(bpy.types.Panel):
-    bl_label      = "NeRF Live Render"
-    bl_idname     = "VIEW3D_PT_nerf_live_render"
-    bl_space_type = "VIEW_3D"
+    bl_label       = "NeRF Live Render"
+    bl_idname      = "VIEW3D_PT_nerf_live_render"
+    bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category   = "NeRF"
+    bl_category    = "NeRF"
 
     def draw(self, context):
         layout = self.layout
         props  = context.scene.nerf_props
 
-        # ── Server connection ─────────────────────────────────────────────────
+        # Connection
         box = layout.box()
-        box.label(text="Server Connection", icon="NETWORK_DRIVE")
+        box.label(text="Server", icon="NETWORK_DRIVE")
         col = box.column(align=True)
         col.prop(props, "host")
         col.prop(props, "port")
 
-        # ── Render size ───────────────────────────────────────────────────────
+        # Render size
         box = layout.box()
         box.label(text="Render Size", icon="IMAGE_DATA")
         col = box.column(align=True)
         col.prop(props, "use_viewport_size")
         if props.use_viewport_size:
             col.prop(props, "viewport_downscale", slider=True)
-            col.label(text="Auto: viewport x downscale", icon="INFO")
         else:
             row = col.row(align=True)
             row.prop(props, "render_width")
             row.prop(props, "render_height")
 
-        # ── Scale / Offset ────────────────────────────────────────────────────
+        # Coordinate alignment
         box = layout.box()
-        box.label(text="Align Units with NeRF", icon="ORIENTATION_GLOBAL")
+        box.label(text="Coordinate Alignment", icon="ORIENTATION_GLOBAL")
         col = box.column(align=True)
         col.prop(props, "nerf_scale")
         row = col.row(align=True)
@@ -724,30 +840,43 @@ class VIEW3D_PT_NeRFLiveRender(bpy.types.Panel):
         row.prop(props, "nerf_offset_y", text="Y")
         row.prop(props, "nerf_offset_z", text="Z")
 
-        # ── Background & Display ──────────────────────────────────────────────
+        # Background + Display
         box = layout.box()
         box.label(text="Background & Display", icon="RENDERLAYERS")
         col = box.column(align=True)
         col.prop(props, "transparent")
         if not props.transparent:
-            col.prop(props, "bg_color", text="Background Color")
+            col.prop(props, "bg_color")
         col.separator()
         col.prop(props, "display_mode", text="")
         col.prop(props, "opacity", slider=True)
 
+        # Depth compositing
+        box = layout.box()
+        box.prop(props, "depth_compositing", icon="IMAGE_ZDEPTH")
+        if props.depth_compositing:
+            col = box.column(align=True)
+            col.prop(props, "nerf_depth_near", text="Near (Bl units)")
+            col.prop(props, "nerf_depth_far",  text="Far  (Bl units)")
+            col.separator()
+            sub = col.column(align=True)
+            sub.scale_y = 0.75
+            sub.label(text="Near = min_near / scale", icon="INFO")
+            sub.label(text="Far  = 2 x bound / scale")
+            sub.label(text="e.g. scale=0.7 bound=1:")
+            sub.label(text="  Near=0.29  Far=2.86")
+
         layout.separator()
 
-        # ── Start / Stop ──────────────────────────────────────────────────────
+        # Start / Stop
         if not props.is_running:
             row = layout.row()
             row.scale_y = 1.8
-            row.operator("nerf.start_live_render", icon="PLAY",
-                         text="Start NeRF View")
+            row.operator("nerf.start_live_render", icon="PLAY", text="Start NeRF View")
         else:
             row = layout.row()
             row.scale_y = 1.4
-            row.operator("nerf.stop_live_render", icon="SNAP_FACE",
-                         text="Stop")
+            row.operator("nerf.stop_live_render", icon="PAUSE", text="Stop")
 
             if _active_state:
                 with _active_state._lock:
@@ -756,33 +885,23 @@ class VIEW3D_PT_NeRFLiveRender(bpy.types.Panel):
                     fps    = _active_state.fps
 
                 box = layout.box()
+                col = box.column(align=True)
                 if error:
-                    col = box.column(align=True)
                     col.alert = True
                     col.label(text=status, icon="ERROR")
                     for i in range(0, len(error), 42):
                         col.label(text=error[i:i+42])
                 else:
-                    col = box.column(align=True)
                     col.label(text=status, icon="CHECKMARK")
                     if fps > 0:
                         col.label(text=f"FPS: {fps:.1f}", icon="TIME")
-
-        # ── Tip ───────────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Scale Note:", icon="INFO")
-        col = box.column(align=True)
-        col.scale_y = 0.75
-        col.label(text="model_manager uses: --scale 0.7")
-        col.label(text="-> Set '--scale' to 0.7 here")
-        col.label(text="Rotate view using Middle Mouse")
-        # Add is_running at the end
-    is_running: bpy.props.BoolProperty(name="Is Running", default=False)
+                    if props.depth_compositing:
+                        col.label(text="Depth: ON", icon="IMAGE_ZDEPTH")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Registration
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 CLASSES = [
     NeRFProperties,
@@ -791,30 +910,28 @@ CLASSES = [
     VIEW3D_PT_NeRFLiveRender,
 ]
 
-
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.nerf_props = bpy.props.PointerProperty(type=NeRFProperties)
-    print("[NeRF Addon] Registered.")
-
+    print("[NeRF Addon] v3.0 registered — GPU depth compositing enabled.")
 
 def unregister():
-    global _active_state, _draw_handle
+    global _active_state, _handle_pixel, _handle_view
     if _active_state:
         _active_state.running = False
-    if _draw_handle:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
-        except Exception:
-            pass
-        _draw_handle = None
-
+    for h in [_handle_pixel, _handle_view]:
+        if h:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(h, "WINDOW")
+            except Exception:
+                pass
+    _handle_pixel = None
+    _handle_view  = None
     del bpy.types.Scene.nerf_props
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     print("[NeRF Addon] Unregistered.")
-
 
 if __name__ == "__main__":
     register()
