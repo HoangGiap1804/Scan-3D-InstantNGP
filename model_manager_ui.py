@@ -343,21 +343,23 @@ with dpg.theme() as global_theme:
         dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabActive, (140, 140, 140))
 
 with dpg.window(label="NeRF Model Manager", tag="primary_window", width=850, height=780):
-    dpg.add_text("3D Model Manager (Instant-NGP)", color=[0, 80, 180])
+    with dpg.group(horizontal=True):
+        dpg.add_text("3D Model Manager (Instant-NGP)", color=[0, 80, 180])
+        btn_add_new = dpg.add_button(label="+ ADD NEW", callback=lambda: dpg.show_item("file_dialog_id"), width=150, height=35, indent=660)
+        
     dpg.add_spacer(height=5)
-    
     dpg.add_text("Recent selected files:", color=[0, 120, 50])
+    
     with dpg.child_window(width=-1, height=620, tag="history_grid", border=False):
         pass
-    
-    dpg.add_spacer(height=10)
-    dpg.add_button(label="BROWSE AND SELECT NEW transforms.json FILE", callback=lambda: dpg.show_item("file_dialog_id"), width=-1, height=45)
     
     dpg.add_spacer(height=10)
     dpg.add_text("Status: Ready", tag="status_text", color=[130, 130, 130])
     
     with dpg.group(horizontal=True):
         dpg.add_text("Server: Stopped", tag="server_status_text", color=[200, 80, 80])
+
+dpg.bind_item_theme(btn_add_new, "action_btn_theme")
 
 dpg.bind_theme(global_theme)
 

@@ -122,9 +122,12 @@ class NeRFRenderer(nn.Module):
         self.mean_count = 0
         self.local_step = 0
 
-    def run(self, rays_o, rays_d, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
+    def run(self, rays_o, rays_d, num_steps=128, upsample_steps=128, bg_color=None, perturb=False,
+            depth_nears=None, depth_fars=None, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # bg_color: [3] in range [0, 1]
+        # depth_nears, depth_fars: optional [B*N] tensors used ONLY for depth_surface normalization;
+        #                          if None, falls back to the aabb-derived nears/fars
         # return: image: [B, N, 3], depth: [B, N]
 
         prefix = rays_o.shape[:-1]
@@ -137,7 +140,7 @@ class NeRFRenderer(nn.Module):
         # choose aabb
         aabb = self.aabb_train if self.training else self.aabb_infer
 
-        # sample steps
+        # sample steps (original logic unchanged)
         nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
         nears.unsqueeze_(-1)
         fars.unsqueeze_(-1)
@@ -221,9 +224,19 @@ class NeRFRenderer(nn.Module):
         # calculate weight_sum (mask)
         weights_sum = weights.sum(dim=-1) # [N]
         
-        # calculate depth 
+        # calculate depth (weighted mean, normalized to [0, 1])
         ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
         depth = torch.sum(weights * ori_z_vals, dim=-1)
+
+        # calculate depth_surface: actual distance to nearest surface point (median depth)
+        # Finds the first sample where cumulative weight >= 0.5 (median of the weight distribution)
+        # Uses depth_nears/depth_fars if provided; otherwise falls back to aabb nears/fars
+        _d_nears = depth_nears.contiguous().view(-1, 1).to(device) if depth_nears is not None else nears
+        _d_fars  = depth_fars.contiguous().view(-1, 1).to(device) if depth_fars  is not None else fars
+        weights_cdf = torch.cumsum(weights, dim=-1)                                   # [N, T]
+        median_idx  = (weights_cdf >= 0.5).long().argmax(dim=-1, keepdim=True)        # [N, 1]
+        depth_surface_raw = torch.gather(z_vals, dim=-1, index=median_idx)            # [N, 1], real dist
+        depth_surface = ((depth_surface_raw - _d_nears) / (_d_fars - _d_nears + 1e-8)).clamp(0, 1).squeeze(-1)  # [N]
 
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
@@ -240,6 +253,7 @@ class NeRFRenderer(nn.Module):
 
         image = image.view(*prefix, 3)
         depth = depth.view(*prefix)
+        depth_surface = depth_surface.view(*prefix)
 
         # tmp: reg loss in mip-nerf 360
         # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
@@ -248,13 +262,17 @@ class NeRFRenderer(nn.Module):
 
         return {
             'depth': depth,
+            'depth_surface': depth_surface,
             'image': image,
             'weights_sum': weights_sum,
         }
 
 
-    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
+    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False,
+                 max_steps=1024, T_thresh=1e-4, depth_nears=None, depth_fars=None, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
+        # depth_nears, depth_fars: optional [B*N] tensors used ONLY for depth_surface normalization;
+        #                          if None, falls back to the aabb-derived nears/fars
         # return: image: [B, N, 3], depth: [B, N]
 
         prefix = rays_o.shape[:-1]
@@ -264,7 +282,7 @@ class NeRFRenderer(nn.Module):
         N = rays_o.shape[0] # N = B * N, in fact
         device = rays_o.device
 
-        # pre-calculate near far
+        # pre-calculate near far (original logic unchanged)
         nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train if self.training else self.aabb_infer, self.min_near)
 
         # mix background color
@@ -299,24 +317,36 @@ class NeRFRenderer(nn.Module):
             if len(sigmas.shape) == 2:
                 K = sigmas.shape[0]
                 depths = []
+                depth_surfaces = []
                 images = []
                 for k in range(K):
                     weights_sum, depth, image = raymarching.composite_rays_train(sigmas[k], rgbs[k], deltas, rays, T_thresh)
                     image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-                    depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+                    # depth_surface: raw distance, normalized with depth_nears/depth_fars if provided
+                    _d_nears_k = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
+                    _d_fars_k  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
+                    depth_surface_k = torch.clamp(depth - _d_nears_k, min=0) / (_d_fars_k - _d_nears_k + 1e-8)
+                    depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
                     images.append(image.view(*prefix, 3))
                     depths.append(depth.view(*prefix))
+                    depth_surfaces.append(depth_surface_k.view(*prefix))
             
-                depth = torch.stack(depths, axis=0) # [K, B, N]
-                image = torch.stack(images, axis=0) # [K, B, N, 3]
+                depth = torch.stack(depths, axis=0)                  # [K, B, N]
+                depth_surface = torch.stack(depth_surfaces, axis=0)  # [K, B, N]
+                image = torch.stack(images, axis=0)                  # [K, B, N, 3]
 
             else:
 
                 weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
                 image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-                depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+                # depth_surface normalized with depth_nears/depth_fars if provided
+                _d_nears = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
+                _d_fars  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
+                depth_surface = torch.clamp(depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
+                depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
                 image = image.view(*prefix, 3)
                 depth = depth.view(*prefix)
+                depth_surface = depth_surface.view(*prefix)
             
             results['weights_sum'] = weights_sum
 
@@ -367,11 +397,17 @@ class NeRFRenderer(nn.Module):
                 step += n_step
 
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-            depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+            # depth_surface normalized with depth_nears/depth_fars if provided
+            _d_nears = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
+            _d_fars  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
+            depth_surface = torch.clamp(depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
+            depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)
+            depth_surface = depth_surface.view(*prefix)
         
         results['depth'] = depth
+        results['depth_surface'] = depth_surface
         results['image'] = image
         results['weights_sum'] = weights_sum
 

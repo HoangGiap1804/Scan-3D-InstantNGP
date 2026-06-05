@@ -94,12 +94,16 @@ def encode_png(image: np.ndarray) -> bytes:
 # Render helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor, transparent=False):
+def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor,
+                 transparent=False, cam_near=None, cam_far=None):
     """
     Render mot frame tu NeRF model.
     Luon tra ve tuple (image, depth_normalized):
       image:            [H, W, 3] float32 (RGB) hoac [H, W, 4] float32 (RGBA)
-      depth_normalized: [H, W]   float32 trong [0, 1]   (0=near, 1=far ray)
+      depth_normalized: [H, W]   float32 trong [0, 1]
+                        - neu cam_near/cam_far duoc truyen vao:
+                            0 = cam_near (Blender clip start), 1 = cam_far (Blender clip end)
+                        - neu khong: dung near/far tinh tu aabb cua NeRF
     """
     from nerf.utils import get_rays
 
@@ -118,11 +122,20 @@ def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor, transparent=F
         else (bg_color_tensor.to(trainer.device) if bg_color_tensor is not None else None)
     )
 
+    # Chuan bi depth_nears / depth_fars cho depth_surface (near/far cua Blender camera)
+    N = H * W
+    depth_nears_t = None
+    depth_fars_t  = None
+    if cam_near is not None and cam_far is not None:
+        depth_nears_t = torch.full((N,), cam_near, dtype=torch.float32, device=trainer.device)
+        depth_fars_t  = torch.full((N,), cam_far,  dtype=torch.float32, device=trainer.device)
+
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=trainer.fp16):
             outputs = trainer.model.render(
                 data['rays_o'], data['rays_d'],
                 staged=True, bg_color=render_bg, perturb=False,
+                depth_nears=depth_nears_t, depth_fars=depth_fars_t,
                 **vars(trainer.opt)
             )
 
@@ -130,7 +143,7 @@ def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor, transparent=F
         trainer.ema.restore()
 
     # ── Depth (always available) ──────────────────────────────────────────────
-    pred_depth = outputs['depth'].reshape(H, W).detach().cpu().numpy()
+    pred_depth = outputs['depth_surface'].reshape(H, W).detach().cpu().numpy()
     pred_depth = np.clip(pred_depth, 0.0, 1.0).astype(np.float32)
 
     # ── Color ─────────────────────────────────────────────────────────────────
@@ -187,6 +200,8 @@ class NeRFHandler(socketserver.StreamRequestHandler):
                 bg          = req.get("bg_color", [1.0, 1.0, 1.0])
                 transparent  = bool(req.get("transparent",   False))
                 include_depth = bool(req.get("include_depth", False))
+                cam_near    = req.get("cam_near", None)   # Blender clip start
+                cam_far     = req.get("cam_far",  None)   # Blender clip end
                 bg_tensor    = torch.tensor(bg, dtype=torch.float32)
 
                 t0 = time.perf_counter()
@@ -196,6 +211,8 @@ class NeRFHandler(socketserver.StreamRequestHandler):
                         pose, intrinsics, W, H,
                         bg_color_tensor=bg_tensor,
                         transparent=transparent,
+                        cam_near=cam_near,
+                        cam_far=cam_far,
                     )
                 dt_ms = (time.perf_counter() - t0) * 1000.0
 

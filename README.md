@@ -44,7 +44,10 @@ python train.py --path ./data/custom_data --workspace ./workspace --epochs 100 -
 # Nâng cao
 python train.py --path videos/vasedeck/ --workspace workspaces/workspace_vasedeck8 --num_rays 1024 --max_steps 562 --bound 4 --bg_radius 8 --fp16 --epochs 1000 --error_map --dt_gamma 0.0078 --min_near 0.1
 
-python train.py --path videos/kitchen/ --workspace workspaces/workspace_kitchen3 --num_rays 1024 --max_steps 562 --bound 1 --bg_radius 2 --fp16 --epochs 1000 --error_map --dt_gamma 0.0078 --min_near 0.1 --color_space linear --density_thresh 0.02
+python main_nerf.py data/nerf_synthetic/chair/ --workspace workspaces/chair -O --bound 1.0 --scale 0.7 --dt_gamma 0 --color_space linear --error_map --gui
+
+python main_nerf.py videos/firekeeper/ --workspace workspaces/firekeeper1 -O --bound 1.
+2 --bg_radius 16 --scale 0.7 --color_space linear --error_map --gui --num_steps 256 --num_rays 1024 --downscale 2
 ```
 
 ## 5. API dành cho Mobile App
