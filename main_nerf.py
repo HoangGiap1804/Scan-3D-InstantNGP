@@ -27,8 +27,6 @@ if __name__ == '__main__':
     parser.add_argument('--upsample_steps', type=int, default=0, help="num steps up-sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
     parser.add_argument('--max_ray_batch', type=int, default=4096, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
-    parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
-
 
     ### dataset options
     parser.add_argument('--color_space', type=str, default='srgb', help="Color space, supports (linear, srgb)")
@@ -51,23 +49,15 @@ if __name__ == '__main__':
     parser.add_argument('--fovy', type=float, default=50, help="default GUI camera fovy")
     parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
 
-    ### experimental
     parser.add_argument('--error_map', action='store_true', help="use error map to sample rays")
-    parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
-    parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
 
     opt = parser.parse_args()
 
     if opt.O:
         opt.fp16 = True
         opt.cuda_ray = True
-        opt.preload = True
+        opt.preload = False
     
-    if opt.patch_size > 1:
-        opt.error_map = False # do not use error_map if use patch-based training
-        # assert opt.patch_size > 16, "patch_size should > 16 to run LPIPS loss."
-        assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
-
 
     opt.fp16 = True
     from nerf.network_tcnn import NeRFNetwork
@@ -94,7 +84,7 @@ if __name__ == '__main__':
     
     if opt.test:
         
-        metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+        metrics = [PSNRMeter()]
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
 
         if opt.gui:
@@ -120,7 +110,7 @@ if __name__ == '__main__':
         # decay to 0.1 * init_lr at last iter step
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
-        metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+        metrics = [PSNRMeter()]
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
 
         if opt.gui:

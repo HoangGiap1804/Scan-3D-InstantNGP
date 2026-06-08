@@ -178,6 +178,32 @@ def get_blender_clip_planes(region_3d):
 
 
 # =============================================================================
+# Final Render (F12) Camera Helpers
+# =============================================================================
+
+def get_scene_camera_pose(scene, scale=1.0, offset=None):
+    if offset is None: offset = [0.0, 0.0, 0.0]
+    cam = scene.camera
+    if not cam: return None
+    c2w = np.array(cam.matrix_world, dtype=np.float32).reshape(4, 4)
+    return blender_to_nerf_matrix(c2w, scale=scale, offset=offset)
+
+def get_scene_intrinsics(scene, W, H):
+    cam = scene.camera
+    if not cam: return np.array([W/2, H/2, W/2, H/2], dtype=np.float32)
+    # Calculate focal length in pixels
+    focal = (W / 2.0) / np.tan(cam.data.angle / 2.0)
+    if cam.data.sensor_fit == 'VERTICAL':
+        focal = (H / 2.0) / np.tan(cam.data.angle / 2.0)
+    return np.array([focal, focal, W / 2.0, H / 2.0], dtype=np.float32)
+
+def get_scene_clip_planes(scene):
+    cam = scene.camera
+    if not cam: return 0.1, 100.0
+    return float(cam.data.clip_start), float(cam.data.clip_end)
+
+
+# =============================================================================
 # GPU texture helpers
 # =============================================================================
 
@@ -367,6 +393,43 @@ def network_thread_fn(host, port, state):
 
 
 # =============================================================================
+# F12 Final Render Sync Network
+# =============================================================================
+
+def fetch_nerf_render_sync(props, pose, intrinsics, W, H, cam_near, cam_far):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15.0)  # longer timeout for final render
+    try:
+        sock.connect((props.host, props.port))
+        req = {
+            "pose": pose.tolist(),
+            "intrinsics": intrinsics.tolist(),
+            "W": W, "H": H,
+            "bg_color": list(props.bg_color),
+            "transparent": True, # always transparent for compositing
+            "include_depth": True,
+            "cam_near": float(cam_near * props.nerf_scale),
+            "cam_far": float(cam_far * props.nerf_scale),
+        }
+        send_framed(sock, json.dumps(req).encode("utf-8"))
+        
+        png_bytes = recv_framed(sock)
+        depth_bytes = recv_framed(sock)
+        
+        if png_bytes is None or depth_bytes is None:
+            return None, None
+            
+        image = decode_png_to_numpy(png_bytes)
+        depth = np.frombuffer(depth_bytes, dtype=np.float32).reshape(H, W)
+        return image, depth
+    except Exception as e:
+        print(f"[NeRF Addon] F12 Sync Render Error: {e}")
+        return None, None
+    finally:
+        sock.close()
+
+
+# =============================================================================
 # Display helpers
 # =============================================================================
 
@@ -491,6 +554,81 @@ def draw_nerf_behind(context):
 
 
 # =============================================================================
+# F12 Final Render Handlers
+# =============================================================================
+
+import bpy.app.handlers
+
+@bpy.app.handlers.persistent
+def nerf_render_pre_handler(scene):
+    if not hasattr(scene, 'nerf_props'): return
+    props = scene.nerf_props
+    if not props.enable_f12_render:
+        return
+        
+    print(f"\n[NeRF Addon] Fetching NeRF frame for F12 Render (Frame {scene.frame_current})...")
+    
+    # Calculate render size
+    pct = scene.render.resolution_percentage / 100.0
+    W = int(scene.render.resolution_x * pct)
+    H = int(scene.render.resolution_y * pct)
+    
+    pose = get_scene_camera_pose(scene, scale=props.nerf_scale, offset=[props.nerf_offset_x, props.nerf_offset_y, props.nerf_offset_z])
+    if pose is None: 
+        print("[NeRF Addon] No active camera found!")
+        return
+    
+    intr = get_scene_intrinsics(scene, W, H)
+    cam_near, cam_far = get_scene_clip_planes(scene)
+    
+    img, dep = fetch_nerf_render_sync(props, pose, intr, W, H, cam_near, cam_far)
+    if img is None:
+        print("[NeRF Addon] Failed to fetch NeRF render for F12.")
+        return
+        
+    print("[NeRF Addon] NeRF frame received. Updating Compositor images...")
+    
+    # img is [H, W, 4] float32. dep is [H, W] float32.
+    # Blender origin is bottom-left. NeRF is top-left.
+    img_flipped = img[::-1, :, :]
+    dep_flipped = dep[::-1, :]
+    
+    if img_flipped.shape[2] == 3:
+        rgba = np.ones((H, W, 4), dtype=np.float32)
+        rgba[..., :3] = img_flipped
+        img_flipped = rgba
+        
+    # Convert normalized [0, 1] depth back to true metric depth in Blender space
+    dep_metric = cam_near + dep_flipped * (cam_far - cam_near)
+    
+    dep_rgba = np.zeros((H, W, 4), dtype=np.float32)
+    dep_rgba[..., 0] = dep_metric
+    dep_rgba[..., 1] = dep_metric
+    dep_rgba[..., 2] = dep_metric
+    dep_rgba[..., 3] = 1.0
+    
+    # Update Color Image
+    color_img_name = "NeRF_Color"
+    if color_img_name not in bpy.data.images:
+        bpy.data.images.new(color_img_name, width=W, height=H, alpha=True, float_buffer=True)
+    c_img = bpy.data.images[color_img_name]
+    if c_img.size[0] != W or c_img.size[1] != H:
+        c_img.scale(W, H)
+    c_img.pixels.foreach_set(img_flipped.ravel())
+    
+    # Update Depth Image
+    depth_img_name = "NeRF_Depth"
+    if depth_img_name not in bpy.data.images:
+        bpy.data.images.new(depth_img_name, width=W, height=H, alpha=False, float_buffer=True)
+    d_img = bpy.data.images[depth_img_name]
+    if d_img.size[0] != W or d_img.size[1] != H:
+        d_img.scale(W, H)
+    d_img.pixels.foreach_set(dep_rgba.ravel())
+    
+    print("[NeRF Addon] Compositor images updated successfully!")
+
+
+# =============================================================================
 # Operators
 # =============================================================================
 
@@ -551,8 +689,8 @@ class NERF_OT_StartLiveRender(bpy.types.Operator):
                 pose, intr, render_W, render_H,
                 [bg_r, bg_g, bg_b],
                 transparent=props.transparent,
-                cam_near=cam_near,
-                cam_far=cam_far,
+                cam_near=cam_near * scale,
+                cam_far=cam_far * scale,
             )
 
             img, dep, iw, ih = _active_state.get_render_if_new()
@@ -661,6 +799,66 @@ class NERF_OT_StopLiveRender(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class NERF_OT_SetupCompositor(bpy.types.Operator):
+    """Set up Compositing Nodes to merge Blender render with NeRF render during F12 Render"""
+    bl_idname  = "nerf.setup_compositor"
+    bl_label   = "Setup NeRF Compositor"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        scene.use_nodes = True
+        tree = scene.node_tree
+        
+        # Bật Z pass cho view layer hiện tại
+        if scene.view_layers.get("ViewLayer"):
+            scene.view_layers["ViewLayer"].use_pass_z = True
+            
+        # Clear existing nodes
+        tree.nodes.clear()
+        
+        # Add Nodes
+        rl = tree.nodes.new("CompositorNodeRLayers")
+        rl.location = (-400, 200)
+        
+        comp = tree.nodes.new("CompositorNodeComposite")
+        comp.location = (400, 0)
+        
+        # Create Images if not exist
+        color_img_name = "NeRF_Color"
+        if color_img_name not in bpy.data.images:
+            bpy.data.images.new(color_img_name, width=512, height=512, alpha=True, float_buffer=True)
+        img_node = tree.nodes.new("CompositorNodeImage")
+        img_node.image = bpy.data.images[color_img_name]
+        img_node.location = (-400, -100)
+        
+        depth_img_name = "NeRF_Depth"
+        if depth_img_name not in bpy.data.images:
+            bpy.data.images.new(depth_img_name, width=512, height=512, alpha=False, float_buffer=True)
+        dep_node = tree.nodes.new("CompositorNodeImage")
+        dep_node.image = bpy.data.images[depth_img_name]
+        dep_node.location = (-400, -350)
+        
+        # Z Combine Node
+        zcomb = tree.nodes.new("CompositorNodeZcombine")
+        zcomb.location = (100, 100)
+        zcomb.use_alpha = True
+        zcomb.use_antialias_z = True
+        
+        # Links
+        tree.links.new(rl.outputs["Image"], zcomb.inputs[0]) # Blender Image
+        if "Depth" in rl.outputs:
+            tree.links.new(rl.outputs["Depth"], zcomb.inputs[1]) # Blender Z
+            
+        tree.links.new(img_node.outputs["Image"], zcomb.inputs[2]) # NeRF Image
+        tree.links.new(dep_node.outputs["Image"], zcomb.inputs[3]) # NeRF Z
+        
+        tree.links.new(zcomb.outputs["Image"], comp.inputs["Image"])
+        
+        self.report({"INFO"}, "Compositor nodes configured for NeRF F12 Render")
+        return {"FINISHED"}
+
+
 # =============================================================================
 # Properties
 # =============================================================================
@@ -715,6 +913,12 @@ class NeRFProperties(bpy.types.PropertyGroup):
     )
 
     is_running: bpy.props.BoolProperty(name="Is Running", default=False)
+    
+    enable_f12_render: bpy.props.BoolProperty(
+        name="Enable F12 Render Sync",
+        description="Fetch NeRF render and inject into Compositor when pressing F12",
+        default=False,
+    )
 
 
 # =============================================================================
@@ -782,6 +986,17 @@ class VIEW3D_PT_NeRFLiveRender(bpy.types.Panel):
 
         layout.separator()
 
+        # Final Render (F12) Settings
+        box = layout.box()
+        box.label(text="Final Render (F12)", icon="RESTRICT_RENDER_OFF")
+        col = box.column(align=True)
+        col.prop(props, "enable_f12_render")
+        if props.enable_f12_render:
+            col.operator("nerf.setup_compositor", icon="NODETREE", text="Setup Compositor Nodes")
+            col.label(text="Make sure Render Engine is not Workbench.", icon="INFO")
+
+        layout.separator()
+
         # Start / Stop
         if not props.is_running:
             row = layout.row()
@@ -819,6 +1034,7 @@ CLASSES = [
     NeRFProperties,
     NERF_OT_StartLiveRender,
     NERF_OT_StopLiveRender,
+    NERF_OT_SetupCompositor,
     VIEW3D_PT_NeRFLiveRender,
 ]
 
@@ -826,10 +1042,18 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.nerf_props = bpy.props.PointerProperty(type=NeRFProperties)
-    print("[NeRF Addon] v3.1 registered — NeRF always behind 3D objects.")
+    
+    if nerf_render_pre_handler not in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.append(nerf_render_pre_handler)
+        
+    print("[NeRF Addon] v3.2 registered — NeRF F12 Final Render supported.")
 
 def unregister():
     global _active_state, _handle_view
+    
+    if nerf_render_pre_handler in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.remove(nerf_render_pre_handler)
+        
     if _active_state:
         _active_state.running = False
     if _handle_view:

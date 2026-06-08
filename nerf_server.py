@@ -154,13 +154,14 @@ def render_frame(trainer, pose, intrinsics, W, H, bg_color_tensor,
             alpha_t = outputs['image'].reshape(H, W, 3).max(dim=2, keepdim=True)[0]
 
         rgb_t = outputs['image'].reshape(H, W, 3)
-        safe_a = torch.clamp(alpha_t, 1e-6, 1.0)
-        rgb_straight = rgb_t / safe_a
+        # Loại bỏ phép chia rgb_straight = rgb_t / safe_a gây lỗi nhiễu (numerical explosion)
+        # với nền opaque (đặc biệt khi bg_radius > 0, background đã được cộng thẳng vào ảnh).
         if trainer.opt.color_space == 'linear':
-            rgb_straight = linear_to_srgb(rgb_straight)
-        rgb_np  = rgb_straight.detach().cpu().numpy()
+            rgb_t = linear_to_srgb(rgb_t)
+        rgb_np  = rgb_t.detach().cpu().numpy()
         alpha_np = np.clip(alpha_t.detach().cpu().numpy() * 1.5, 0.0, 1.0).astype(np.float32)
-        image = np.concatenate([rgb_np * alpha_np, alpha_np], axis=2)  # premult RGBA
+        # Trả về RGBA (Lưu ý: RGB đã được pre-multiplied hoặc có nền đục từ bg_model)
+        image = np.concatenate([rgb_np, alpha_np], axis=2)
     else:
         rgb_t = outputs['image'].reshape(H, W, 3)
         if trainer.opt.color_space == 'linear':
@@ -293,7 +294,7 @@ if __name__ == "__main__":
     parser.add_argument("--upsample_steps", type=int, default=0)
     parser.add_argument("--update_extra_interval", type=int, default=16)
     parser.add_argument("--max_ray_batch", type=int, default=4096)
-    parser.add_argument("--patch_size", type=int, default=1)
+
 
     # Dataset
     parser.add_argument("--color_space", type=str, default="srgb")
@@ -307,8 +308,6 @@ if __name__ == "__main__":
     parser.add_argument("--density_thresh", type=float, default=10)
     parser.add_argument("--bg_radius", type=float, default=-1)
     parser.add_argument("--error_map", action="store_true")
-    parser.add_argument("--clip_text", type=str, default="")
-    parser.add_argument("--rand_pose", type=int, default=-1)
 
     # GUI (không dùng, nhưng Trainer cần opt.gui, opt.W, opt.H)
     parser.add_argument("--gui", action="store_true", default=False)
@@ -334,9 +333,6 @@ if __name__ == "__main__":
     else:
         opt.fp16 = False
 
-    if opt.patch_size > 1:
-        opt.error_map = False
-        assert opt.num_rays % (opt.patch_size ** 2) == 0
 
     # ── Bắt buộc chạy ở test mode ─────────────────────────────────────────────
     if not opt.test:
@@ -361,7 +357,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = torch.nn.MSELoss(reduction="none")
 
-    metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+    metrics = [PSNRMeter()]
     trainer = Trainer(
         "ngp",
         opt,

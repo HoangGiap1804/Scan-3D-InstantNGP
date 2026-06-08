@@ -53,42 +53,6 @@ def visualize_poses(poses, size=0.1):
     trimesh.Scene(objects).show()
 
 
-def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_range=[0, 2*np.pi]):
-    ''' generate random poses from an orbit camera
-    Args:
-        size: batch size of generated poses.
-        device: where to allocate the output.
-        radius: camera radius
-        theta_range: [min, max], should be in [0, \pi]
-        phi_range: [min, max], should be in [0, 2\pi]
-    Return:
-        poses: [size, 4, 4]
-    '''
-    
-    def normalize(vectors):
-        return vectors / (torch.norm(vectors, dim=-1, keepdim=True) + 1e-10)
-
-    thetas = torch.rand(size, device=device) * (theta_range[1] - theta_range[0]) + theta_range[0]
-    phis = torch.rand(size, device=device) * (phi_range[1] - phi_range[0]) + phi_range[0]
-
-    centers = torch.stack([
-        radius * torch.sin(thetas) * torch.sin(phis),
-        radius * torch.cos(thetas),
-        radius * torch.sin(thetas) * torch.cos(phis),
-    ], dim=-1) # [B, 3]
-
-    # lookat
-    forward_vector = - normalize(centers)
-    up_vector = torch.FloatTensor([0, -1, 0]).to(device).unsqueeze(0).repeat(size, 1) # confused at the coordinate system...
-    right_vector = normalize(torch.cross(forward_vector, up_vector, dim=-1))
-    up_vector = normalize(torch.cross(right_vector, forward_vector, dim=-1))
-
-    poses = torch.eye(4, dtype=torch.float, device=device).unsqueeze(0).repeat(size, 1, 1)
-    poses[:, :3, :3] = torch.stack((right_vector, up_vector, forward_vector), dim=-1)
-    poses[:, :3, 3] = centers
-
-    return poses
-
 
 class NeRFDataset:
     def __init__(self, opt, device, type='train', downscale=1, n_test=10):
@@ -108,7 +72,6 @@ class NeRFDataset:
         self.training = self.type in ['train', 'all', 'trainval']
         self.num_rays = self.opt.num_rays if self.training else -1
 
-        self.rand_pose = opt.rand_pose
 
         # auto-detect transforms.json and split mode.
         if os.path.exists(os.path.join(self.root_path, 'transforms.json')):
@@ -277,29 +240,11 @@ class NeRFDataset:
     def collate(self, index):
 
         B = len(index) # a list of length 1
-
-        # random pose without gt images.
-        if self.rand_pose == 0 or index[0] >= len(self.poses):
-
-            poses = rand_poses(B, self.device, radius=self.radius)
-
-            # sample a low-resolution but full image for CLIP
-            s = np.sqrt(self.H * self.W / self.num_rays) # only in training, assert num_rays > 0
-            rH, rW = int(self.H / s), int(self.W / s)
-            rays = get_rays(poses, self.intrinsics / s, rH, rW, -1)
-
-            return {
-                'H': rH,
-                'W': rW,
-                'rays_o': rays['rays_o'],
-                'rays_d': rays['rays_d'],    
-            }
-
         poses = self.poses[index].to(self.device) # [B, 4, 4]
 
         error_map = None if self.error_map is None else self.error_map[index]
         
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map)
 
         results = {
             'H': self.H,
@@ -332,8 +277,6 @@ class NeRFDataset:
 
     def dataloader(self):
         size = len(self.poses)
-        if self.training and self.rand_pose > 0:
-            size += size // self.rand_pose # index >= size means we use random pose.
         loader = DataLoader(list(range(size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)
         loader._data = self # an ugly fix... we need to access error_map & poses in trainer.
         loader.has_gt = self.images is not None

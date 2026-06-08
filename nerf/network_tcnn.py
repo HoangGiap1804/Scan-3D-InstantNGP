@@ -36,7 +36,7 @@ class NeRFNetwork(NeRFRenderer):
                 "otype": "HashGrid",
                 "n_levels": 16,
                 "n_features_per_level": 2,
-                "log2_hashmap_size": 22,
+                "log2_hashmap_size": 19,
                 "base_resolution": 16,
                 "per_level_scale": per_level_scale,
             },
@@ -93,14 +93,15 @@ class NeRFNetwork(NeRFRenderer):
                     "per_level_scale": 2.0,
                 },
             )
+            self.in_dim_bg = self.encoder_bg.n_output_dims + self.encoder_dir.n_output_dims
             self.bg_net = tcnn.Network(
-                n_input_dims=self.encoder_bg.n_output_dims,
+                n_input_dims=self.in_dim_bg,
                 n_output_dims=3,
                 network_config={
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
                     "output_activation": "None",
-                    "n_neurons": 32,
+                    "n_neurons": 64,
                     "n_hidden_layers": 1,
                 },
             )
@@ -187,9 +188,15 @@ class NeRFNetwork(NeRFRenderer):
 
     def background(self, x, d):
         # x: [N, 2], in [-1, 1]
+        # d: [N, 3], in [-1, 1]
         
         x = (x + 1) / 2 # to [0, 1]
+        d = (d + 1) / 2 # to [0, 1]
+
         h = self.encoder_bg(x)
+        d = self.encoder_dir(d)
+
+        h = torch.cat([d, h], dim=-1)
         h = self.bg_net(h)
         
         # sigmoid activation for rgb

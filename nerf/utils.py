@@ -30,7 +30,7 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
-import lpips
+
 from torchmetrics.functional import structural_similarity_index_measure
 
 def custom_meshgrid(*args):
@@ -278,41 +278,6 @@ class SSIMMeter:
         return f'SSIM = {self.measure():.6f}'
 
 
-class LPIPSMeter:
-    def __init__(self, net='alex', device=None):
-        self.V = 0
-        self.N = 0
-        self.net = net
-
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.fn = lpips.LPIPS(net=net).eval().to(self.device)
-
-    def clear(self):
-        self.V = 0
-        self.N = 0
-
-    def prepare_inputs(self, *inputs):
-        outputs = []
-        for i, inp in enumerate(inputs):
-            inp = inp.permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
-            inp = inp.to(self.device)
-            outputs.append(inp)
-        return outputs
-    
-    def update(self, preds, truths):
-        preds, truths = self.prepare_inputs(preds, truths) # [B, H, W, 3] --> [B, 3, H, W], range in [0, 1]
-        v = self.fn(truths, preds, normalize=True).item() # normalize=True: [0, 1] to [-1, 1]
-        self.V += v
-        self.N += 1
-    
-    def measure(self):
-        return self.V / self.N
-
-    def write(self, writer, global_step, prefix=""):
-        writer.add_scalar(os.path.join(prefix, f"LPIPS ({self.net})"), self.measure(), global_step)
-
-    def report(self):
-        return f'LPIPS ({self.net}) = {self.measure():.6f}'
 
 class Trainer(object):
     def __init__(self, 
@@ -371,10 +336,6 @@ class Trainer(object):
             criterion.to(self.device)
         self.criterion = criterion
 
-        # optionally use LPIPS loss for patch-based training
-        if self.opt.patch_size > 1:
-            import lpips
-            self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
 
         if optimizer is None:
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
@@ -443,11 +404,6 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
         
-        # clip loss prepare
-        if opt.rand_pose >= 0: # =0 means only using CLIP loss, >0 means a hybrid mode.
-            from nerf.clip_utils import CLIPLoss
-            self.clip_loss = CLIPLoss(self.device)
-            self.clip_loss.prepare_text([self.opt.clip_text]) # only support one text prompt now...
 
 
     def __del__(self):
@@ -471,23 +427,6 @@ class Trainer(object):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
 
-        # if there is no gt image, we train with CLIP loss.
-        if 'images' not in data:
-
-            B, N = rays_o.shape[:2]
-            H, W = data['H'], data['W']
-
-            # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
-            pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
-
-            # [debug] uncomment to plot the images used in train_step
-            #torch_vis_2d(pred_rgb[0])
-
-            loss = self.clip_loss(pred_rgb)
-            
-            return pred_rgb, None, loss
-
         images = data['images'] # [B, N, 3/4]
 
         B, N, C = images.shape
@@ -508,24 +447,12 @@ class Trainer(object):
         else:
             gt_rgb = images
 
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
-        # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False, **vars(self.opt))
     
         pred_rgb = outputs['image']
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
-
-        # patch-based rendering
-        if self.opt.patch_size > 1:
-            gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-            pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-
-            # torch_vis_2d(gt_rgb[0])
-            # torch_vis_2d(pred_rgb[0])
-
-            # LPIPS loss [not useful...]
-            loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
 
         # special case for CCNeRF's rank-residual training
         if len(loss.shape) == 3: # [K, B, N]
@@ -537,7 +464,7 @@ class Trainer(object):
             inds = data['inds_coarse'] # [B, N]
 
             # take out, this is an advanced indexing and the copy is unavoidable.
-            error_map = self.error_map[index] # [B, H * W]
+            error_map = self.error_map[index].to(inds.device) # [B, H * W]
 
             # [debug] uncomment to save and visualize error map
             # if self.global_step % 1001 == 0:
@@ -546,14 +473,14 @@ class Trainer(object):
             #     tmp = (tmp - tmp.min()) / (tmp.max() - tmp.min())
             #     cv2.imwrite(os.path.join(self.workspace, f'{self.global_step}.jpg'), (tmp * 255).astype(np.uint8))
 
-            error = loss.detach().to(error_map.device) # [B, N], already in [0, 1]
+            error = loss.detach() # [B, N], already in [0, 1] and on inds.device
             
             # ema update
             ema_error = 0.1 * error_map.gather(1, inds) + 0.9 * error
             error_map.scatter_(1, inds, ema_error)
 
             # put back
-            self.error_map[index] = error_map
+            self.error_map[index] = error_map.to(self.error_map.device)
 
         loss = loss.mean()
 

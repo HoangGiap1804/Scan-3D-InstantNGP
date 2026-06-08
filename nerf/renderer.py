@@ -236,6 +236,7 @@ class NeRFRenderer(nn.Module):
         weights_cdf = torch.cumsum(weights, dim=-1)                                   # [N, T]
         median_idx  = (weights_cdf >= 0.5).long().argmax(dim=-1, keepdim=True)        # [N, 1]
         depth_surface_raw = torch.gather(z_vals, dim=-1, index=median_idx)            # [N, 1], real dist
+        depth_surface_raw = torch.where(weights_sum.unsqueeze(-1) > 0.1, depth_surface_raw, _d_fars)
         depth_surface = ((depth_surface_raw - _d_nears) / (_d_fars - _d_nears + 1e-8)).clamp(0, 1).squeeze(-1)  # [N]
 
         # calculate color
@@ -325,8 +326,10 @@ class NeRFRenderer(nn.Module):
                     # depth_surface: raw distance, normalized with depth_nears/depth_fars if provided
                     _d_nears_k = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
                     _d_fars_k  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
-                    depth_surface_k = torch.clamp(depth - _d_nears_k, min=0) / (_d_fars_k - _d_nears_k + 1e-8)
-                    depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
+                    real_depth = depth / (weights_sum + 1e-8)
+                    real_depth = torch.where(weights_sum > 0.1, real_depth, _d_fars_k)
+                    depth_surface_k = torch.clamp(real_depth - _d_nears_k, min=0) / (_d_fars_k - _d_nears_k + 1e-8)
+                    depth = torch.clamp(real_depth - nears, min=0) / (fars - nears)   # original normalization
                     images.append(image.view(*prefix, 3))
                     depths.append(depth.view(*prefix))
                     depth_surfaces.append(depth_surface_k.view(*prefix))
@@ -342,8 +345,10 @@ class NeRFRenderer(nn.Module):
                 # depth_surface normalized with depth_nears/depth_fars if provided
                 _d_nears = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
                 _d_fars  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
-                depth_surface = torch.clamp(depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
-                depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
+                real_depth = depth / (weights_sum + 1e-8)
+                real_depth = torch.where(weights_sum > 0.1, real_depth, _d_fars)
+                depth_surface = torch.clamp(real_depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
+                depth = torch.clamp(real_depth - nears, min=0) / (fars - nears)   # original normalization
                 image = image.view(*prefix, 3)
                 depth = depth.view(*prefix)
                 depth_surface = depth_surface.view(*prefix)
@@ -400,8 +405,10 @@ class NeRFRenderer(nn.Module):
             # depth_surface normalized with depth_nears/depth_fars if provided
             _d_nears = depth_nears.contiguous().view(-1).to(device) if depth_nears is not None else nears
             _d_fars  = depth_fars.contiguous().view(-1).to(device)  if depth_fars  is not None else fars
-            depth_surface = torch.clamp(depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
-            depth = torch.clamp(depth - nears, min=0) / (fars - nears)   # original normalization
+            real_depth = depth / (weights_sum + 1e-8)
+            real_depth = torch.where(weights_sum > 0.1, real_depth, _d_fars)
+            depth_surface = torch.clamp(real_depth - _d_nears, min=0) / (_d_fars - _d_nears + 1e-8)
+            depth = torch.clamp(real_depth - nears, min=0) / (fars - nears)   # original normalization
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)
             depth_surface = depth_surface.view(*prefix)
