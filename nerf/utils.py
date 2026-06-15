@@ -8,13 +8,11 @@ import warnings
 import tensorboardX
 
 import numpy as np
-import pandas as pd
 
 import time
 from datetime import datetime
 
 import cv2
-import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -30,8 +28,6 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
-
-from torchmetrics.functional import structural_similarity_index_measure
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -148,60 +144,7 @@ def seed_everything(seed):
     #torch.backends.cudnn.benchmark = True
 
 
-def torch_vis_2d(x, renormalize=False):
-    # x: [3, H, W] or [1, H, W] or [H, W]
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import torch
-    
-    if isinstance(x, torch.Tensor):
-        if len(x.shape) == 3:
-            x = x.permute(1,2,0).squeeze()
-        x = x.detach().cpu().numpy()
-        
-    print(f'[torch_vis_2d] {x.shape}, {x.dtype}, {x.min()} ~ {x.max()}')
-    
-    x = x.astype(np.float32)
-    
-    # renormalize
-    if renormalize:
-        x = (x - x.min(axis=0, keepdims=True)) / (x.max(axis=0, keepdims=True) - x.min(axis=0, keepdims=True) + 1e-8)
 
-    plt.imshow(x)
-    plt.show()
-
-
-def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
-
-    X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
-    Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
-    Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(S)
-
-    u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
-    with torch.no_grad():
-        for xi, xs in enumerate(X):
-            for yi, ys in enumerate(Y):
-                for zi, zs in enumerate(Z):
-                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
-                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [S, 3]
-                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
-                    u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
-    return u
-
-
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
-    #print('threshold: {}'.format(threshold))
-    u = extract_fields(bound_min, bound_max, resolution, query_func)
-
-    #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
-    
-    vertices, triangles = mcubes.marching_cubes(u, threshold)
-
-    b_max_np = bound_max.detach().cpu().numpy()
-    b_min_np = bound_min.detach().cpu().numpy()
-
-    vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
-    return vertices, triangles
 
 
 class PSNRMeter:
@@ -241,41 +184,6 @@ class PSNRMeter:
         return f'PSNR = {self.measure() + 2:.6f}'
 
 
-class SSIMMeter:
-    def __init__(self, device=None):
-        self.V = 0
-        self.N = 0
-
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    def clear(self):
-        self.V = 0
-        self.N = 0
-
-    def prepare_inputs(self, *inputs):
-        outputs = []
-        for i, inp in enumerate(inputs):
-            inp = inp.permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
-            inp = inp.to(self.device)
-            outputs.append(inp)
-        return outputs
-
-    def update(self, preds, truths):
-        preds, truths = self.prepare_inputs(preds, truths) # [B, H, W, 3] --> [B, 3, H, W], range in [0, 1]
-
-        ssim = structural_similarity_index_measure(preds, truths)
-
-        self.V += ssim
-        self.N += 1
-
-    def measure(self):
-        return self.V / self.N
-
-    def write(self, writer, global_step, prefix=""):
-        writer.add_scalar(os.path.join(prefix, "SSIM"), self.measure(), global_step)
-
-    def report(self):
-        return f'SSIM = {self.measure():.6f}'
 
 
 
@@ -483,11 +391,6 @@ class Trainer(object):
             self.error_map[index] = error_map.to(self.error_map.device)
 
         loss = loss.mean()
-
-        # extra loss
-        # pred_weights_sum = outputs['weights_sum'] + 1e-8
-        # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
-        # loss = loss + loss_ws.mean()
 
         return pred_rgb, gt_rgb, loss
 

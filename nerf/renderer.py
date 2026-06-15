@@ -46,17 +46,6 @@ def sample_pdf(bins, weights, n_samples, det=False):
     return samples
 
 
-def plot_pointcloud(pc, color=None):
-    # pc: [N, 3]
-    # color: [N, 3/4]
-    print('[visualize points]', pc.shape, pc.dtype, pc.min(0), pc.max(0))
-    pc = trimesh.PointCloud(pc, color)
-    # axis
-    axes = trimesh.creation.axis(axis_length=4)
-    # sphere
-    sphere = trimesh.creation.icosphere(radius=1)
-    trimesh.Scene([pc, axes, sphere]).show()
-
 
 class NeRFRenderer(nn.Module):
     def __init__(self,
@@ -145,8 +134,6 @@ class NeRFRenderer(nn.Module):
         nears.unsqueeze_(-1)
         fars.unsqueeze_(-1)
 
-        #print(f'nears = {nears.min().item()} ~ {nears.max().item()}, fars = {fars.min().item()} ~ {fars.max().item()}')
-
         z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0) # [1, T]
         z_vals = z_vals.expand((N, num_steps)) # [N, T]
         z_vals = nears + (fars - nears) * z_vals # [N, T], in [nears, fars]
@@ -160,8 +147,6 @@ class NeRFRenderer(nn.Module):
         # generate xyzs
         xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 1] -> [N, T, 3]
         xyzs = torch.min(torch.max(xyzs, aabb[:3]), aabb[3:]) # a manual clip.
-
-        #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
         # query SDF and RGB
         density_outputs = self.density(xyzs.reshape(-1, 3))
@@ -256,11 +241,6 @@ class NeRFRenderer(nn.Module):
         depth = depth.view(*prefix)
         depth_surface = depth_surface.view(*prefix)
 
-        # tmp: reg loss in mip-nerf 360
-        # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
-        # mid_zs = (z_vals + z_vals_shifted) / 2 # [N, T]
-        # loss_dist = (torch.abs(mid_zs.unsqueeze(1) - mid_zs.unsqueeze(2)) * (weights.unsqueeze(1) * weights.unsqueeze(2))).sum() + 1/3 * ((z_vals_shifted - z_vals_shifted) * (weights ** 2)).sum()
-
         return {
             'depth': depth,
             'depth_surface': depth_surface,
@@ -304,15 +284,8 @@ class NeRFRenderer(nn.Module):
 
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
 
-            #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
-            
             sigmas, rgbs = self(xyzs, dirs)
-            # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
-            # sigmas = density_outputs['sigma']
-            # rgbs = self.color(xyzs, dirs, **density_outputs)
             sigmas = self.density_scale * sigmas
-
-            #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
 
             # special case for CCNeRF's residual learning
             if len(sigmas.shape) == 2:
@@ -388,9 +361,6 @@ class NeRFRenderer(nn.Module):
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
                 sigmas, rgbs = self(xyzs, dirs)
-                # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
-                # sigmas = density_outputs['sigma']
-                # rgbs = self.color(xyzs, dirs, **density_outputs)
                 sigmas = self.density_scale * sigmas
 
                 raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
