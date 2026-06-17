@@ -216,6 +216,19 @@ def delete_item_cb(sender=None, app_data=None, user_data=None):
     # Nếu đang chạy server cho item này thì dừng
     if file_path == active_server_file_path:
         stop_server_cb()
+        
+    # Xóa thư mục workspace tương ứng
+    try:
+        dir_path = os.path.dirname(file_path).replace('\\', '/')
+        new_workspace = os.path.basename(dir_path) or "my_model"
+        workspace_dir = os.path.join("workspaces", new_workspace)
+        if os.path.exists(workspace_dir):
+            import shutil
+            shutil.rmtree(workspace_dir)
+            print(f"Deleted workspace: {workspace_dir}")
+    except Exception as e:
+        print(f"Error deleting workspace: {e}")
+        
     render_history_grid()
 
 def launch_command(cmd, status_msg):
