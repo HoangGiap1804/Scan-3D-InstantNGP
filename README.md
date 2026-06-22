@@ -13,8 +13,6 @@ https://drive.google.com/file/d/1FHWqGcw5PI7swkoer34an0TDXLeCboA2/view?usp=drive
 
 https://drive.google.com/file/d/1I26GQ9khzQa6KLNLXDrR7l8XJhFIent2/view?usp=drive_link
 
-https://raw.githubusercontent.com/HoangGiap1804/Scan-3D-InstantNGP/feat/optimized_render/assets/2026-06-15%2021-10-26.mp4
-
 ## 1. Cài đặt môi trường
 
 Đảm bảo bạn đã cài đặt Python 3.9+ và các thư viện cần thiết. Khuyến nghị sử dụng môi trường ảo (virtual environment) hoặc Nix.
