@@ -9,9 +9,9 @@ Hệ thống cho phép người dùng huấn luyện mô hình 3D từ dữ li�
 
 ### Video hiển thị
 
-https://github.com/HoangGiap1804/Scan-3D-InstantNGP/blob/feat/optimized_render/assets/2026-06-15%2021-10-26.mp4
+https://drive.google.com/file/d/1FHWqGcw5PI7swkoer34an0TDXLeCboA2/view?usp=drive_link
 
-https://github.com/HoangGiap1804/Scan-3D-InstantNGP/blob/feat/optimized_render/assets/2026-06-15%2021-15-58.mp4
+https://drive.google.com/file/d/1I26GQ9khzQa6KLNLXDrR7l8XJhFIent2/view?usp=drive_link
 
 ## 1. Cài đặt môi trường
 
